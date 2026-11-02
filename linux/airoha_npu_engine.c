@@ -11,6 +11,8 @@
 #include "airoha_npu_crypto_proto.h"
 #include "airoha_npu_engine.h"
 
+#define AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE 1024
+
 struct airoha_crypto_engine {
 	struct aead_engine_alg alg;
 	struct crypto_engine *engine;
@@ -24,6 +26,11 @@ struct airoha_crypto_engine {
 
 static atomic64_t npu_submitted = ATOMIC64_INIT(0);
 static atomic64_t npu_busy = ATOMIC64_INIT(0);
+static bool npu_enable = true;
+
+module_param(npu_enable, bool, 0644);
+MODULE_PARM_DESC(npu_enable,
+		 "Enable NPU offload above the minimum payload size (default: true)");
 
 static int airoha_counter_get(char *buffer, const struct kernel_param *param)
 {
@@ -103,8 +110,16 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 {
 	struct airoha_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
 	struct airoha_crypto_reqctx *rctx = aead_request_ctx(req);
+	u32 data_len = req->cryptlen;
 	int ret;
 
+	if (!READ_ONCE(npu_enable))
+		return -EAGAIN;
+	if (decrypt && data_len >= AIROHA_CRYPTO_TAG_SIZE)
+		data_len -= AIROHA_CRYPTO_TAG_SIZE;
+	if ((!decrypt || req->cryptlen >= AIROHA_CRYPTO_TAG_SIZE) &&
+	    data_len <= AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE)
+		return -EAGAIN;
 	if (atomic_cmpxchg(&ctx->engine->in_flight, 0, 1)) {
 		atomic64_inc(&npu_busy);
 		return -EAGAIN;

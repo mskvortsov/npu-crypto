@@ -106,9 +106,17 @@ the wrapper clears its key and counter arrays. The portable C implementation is 
 The QEMU test exercises 40 AEAD vectors, bad tags, unaligned buffers and
 in-place operation with nonzero starting counters.
 
-The Linux engine admits one request at a time. If one is already in flight,
-it returns `-EAGAIN` immediately; the WireGuard patch then uses its software
-ChaCha20-Poly1305 path. The read-only module parameters `npu_submitted` and
+By default, the Linux engine admits one request at a time. The writable
+`npu_enable` module parameter controls NPU use at runtime. When enabled, only
+requests with more than 1024 bytes of payload are submitted to the NPU; smaller
+requests return `-EAGAIN` so the WireGuard patch uses its software
+ChaCha20-Poly1305 path, which may use NEON. Set
+`/sys/module/airoha_npu_crypto/parameters/npu_enable` to `0` to send all
+requests through that software path, or `1` to enable the size threshold again.
+If the NPU is already busy, larger requests also fall back to software.
+The read-only parameters `npu_submitted` and
 `npu_busy` count accepted and busy-rejected requests respectively since the
-module was loaded. Busy counts are requests offered to this private algorithm,
-not a direct measurement of NEON use. Authentication failures do not fall back.
+module was loaded; requests skipped because they are small or NPU use is
+disabled do not increment either counter. Busy counts are requests offered to
+this private algorithm, not a direct measurement of NEON use. Authentication
+failures do not fall back.
