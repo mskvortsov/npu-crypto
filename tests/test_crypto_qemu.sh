@@ -9,7 +9,7 @@ perl crypto_standalone/cryptogams/poly1305-riscv.pl 32 "$poly"
 for backend in c asm; do
  poly_flag=
  if [ "$backend" = asm ]; then poly_flag=-DNPU_POLY1305_ASM; fi
- for batch in 1 2 3; do
+ for batch in 1 2 4 8; do
 	riscv64-unknown-elf-gcc -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
 		-Os -ffreestanding -fno-builtin -nostdlib -DAN7581 -DNOWIFI \
 		-DNPU_CRYPTO_TEST -DNPU_CRYPTO_QEMU -DNPU_CHACHA_ASM $poly_flag \
@@ -25,7 +25,7 @@ for backend in c asm; do
 		-DAIROHA_CRYPTO_NPU_BATCH_SIZE="$batch" -I. -T tests/qemu/link.ld \
 		tests/qemu/mailbox_start.S tests/qemu/mailbox.c \
 		crypto_standalone/service.c npu_crypto.c "$asm" "$poly" -lgcc -o "$out"
-	timeout 60 qemu-system-riscv32 -machine virt -smp 8 -m 128M -nographic \
+	timeout 60 qemu-system-riscv32 -machine virt -smp 9 -m 128M -nographic \
 		-bios none -kernel "$out" -no-reboot
 	printf 'Backend %s, batch size %s: 100 concurrent mailbox encrypt/decrypt rounds passed\n' "$backend" "$batch"
 done

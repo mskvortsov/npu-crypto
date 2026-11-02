@@ -1,5 +1,5 @@
 /* Model the host mailbox registers in QEMU RAM. The firmware still runs its
- * real service loop on harts 0..5; hart 6 plays the role of the Linux host. */
+ * real service loop on harts 0..7; hart 8 plays the role of the Linux host. */
 #include "npu_crypto.h"
 #include "npu_regs.h"
 #include "npu_crypto_profile.h"

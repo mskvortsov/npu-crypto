@@ -30,11 +30,11 @@ tag leaves the ciphertext unchanged. The core also compiles for RV32 as part of 
 ## Dedicated image
 
 `make crypto-firmware` builds `build/AN7581_CRYPTO/npu_rv32.bin`. This
-experimental image uses eight harts for one request at a time and does not
-initialize or provide the normal NPU firmware services. Hart 0 coordinates the
-request; all harts split both the ChaCha20 blocks and Poly1305 input blocks.
-Each hart computes its partial accumulator and power of r, and hart 0 combines
-the results modulo 2^130-5. For decryption, authentication completes before
+experimental image uses all eight harts and does not initialize or provide the
+normal NPU firmware services. `AIROHA_CRYPTO_NPU_BATCH_SIZE` selects 1, 2, 4,
+or 8 simultaneous packets, with respectively 8, 4, 2, or 1 hart per packet.
+Each group leader coordinates its packet and combines the Poly1305 portions
+modulo 2^130-5. For decryption, authentication completes before
 any plaintext is produced. Its data image is empty. The
 image requires a dedicated host driver; it is not compatible with the existing
 Airoha NPU driver. A prototype dedicated Linux driver and WireGuard patch
@@ -42,12 +42,13 @@ are in `linux/` and have been exercised on the selected OpenWrt target.
 
 The host must clear MIB30 and MIB31 before starting all eight harts, then wait
 for `0x43525931` in MIB31 before submitting a request. Hart 0 signals MIB30
-after clearing shared state, then waits for all seven workers to start before
-publishing readiness. If a worker does not start, the driver times out and
-WireGuard can use software crypto. Queue 0 uses the request layout above.
+after clearing shared state. Each group waits for every leader and worker to
+start before publishing readiness. If a hart does not start, the driver times
+out and WireGuard can use software crypto. Each group uses the mailbox queue
+whose index equals its leader's hart ID, with the request layout above.
 For each request, the host writes CTRL0 (DMA address), CTRL1 (buffer size), and
 CTRL3 (1: slot 0, blocking), in that order, then increments CTRL2 as the final
-doorbell write. It must serialize requests and wait for CTRL3 bit 1 before
+doorbell write. It must serialize requests per queue and wait for CTRL3 bit 1 before
 reading status and the DMA buffer. The firmware polls the doorbell and writes
 status in CTRL3 bits 4:2. This ordering differs from the existing host
 mailbox helper. Host DMA and MMIO ordering must be enforced by the driver.
@@ -106,14 +107,15 @@ the wrapper clears its key and counter arrays. The portable C implementation is 
 The QEMU test exercises 40 AEAD vectors, bad tags, unaligned buffers and
 in-place operation with nonzero starting counters.
 
-By default, the Linux engine admits one request at a time. The writable
+By default, the Linux engine admits four NPU requests at a time. The writable
 `npu_enable` module parameter controls NPU use at runtime. When enabled, only
 requests with more than 1024 bytes of payload are submitted to the NPU; smaller
 requests return `-EAGAIN` so the WireGuard patch uses its software
 ChaCha20-Poly1305 path, which may use NEON. Set
 `/sys/module/airoha_npu_crypto/parameters/npu_enable` to `0` to send all
 requests through that software path, or `1` to enable the size threshold again.
-If the NPU is already busy, larger requests also fall back to software.
+If the NPU is already busy, `npu_fallback` selects software fallback when set
+or waiting for a free slot when cleared.
 The read-only parameters `npu_submitted` and
 `npu_busy` count accepted and busy-rejected requests respectively since the
 module was loaded; requests skipped because they are small or NPU use is

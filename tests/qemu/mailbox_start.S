@@ -11,7 +11,7 @@ _start:
  slli t1, t1, 14
  add sp, sp, t1
  mv a0, t0
- li t1, 6
+ li t1, 8
  beq t0, t1, 1f
  call crypto_service
 1:
@@ -22,4 +22,4 @@ _start:
 .section .bss
 .balign 16
 stacks:
- .space 131072
+ .space 147456

@@ -7,7 +7,7 @@
 #define SCRATCH_SIZE (NPU_CRYPTO_MAX_DATA + sizeof(struct npu_crypto_request_aad))
 #define GROUPS AIROHA_CRYPTO_NPU_BATCH_SIZE
 #define HARTS_PER_PACKET AIROHA_CRYPTO_NPU_HARTS_PER_PACKET
-#define ACTIVE_HARTS 6
+#define ACTIVE_HARTS 8
 #define WORKERS_START 0x43525731
 #define CRYPTO_READY 0x43525931
 #ifndef NPU_POLY1305_SRAM
@@ -48,11 +48,15 @@ struct crypto_group {
 	volatile struct crypto_job job;
 	u32 parts[8][5], powers[8][5];
 	u8 poly_key[32];
-	volatile u32 seq, done[6], ready[6];
+	volatile u32 seq, done[8], ready[8];
 	u32 profiling;
 	struct airoha_profile_sample sample;
 };
 static struct crypto_group group[GROUPS];
+static volatile u32 leader_ready[GROUPS];
+/* The hardware mutex register address aliases hart pairs 0/4 through 3/7.
+ * Serialize each pair before either attempts the shared hardware mutex. */
+static volatile u32 notify_pair_want[4][2], notify_pair_turn[4];
 #if NPU_POLY1305_SRAM
 static u32 poly_scratch[ACTIVE_HARTS][POLY_SCRATCH_BYTES / sizeof(u32)];
 #endif
@@ -74,7 +78,7 @@ static void fence_all(void) { __asm__ volatile("fence rw, rw" ::: "memory"); }
  * number of harts, accounting for that extra work on the other portions. */
 static u32 poly_boundary(u32 blocks, u32 portion)
 {
-#if HARTS_PER_PACKET == 6
+#if HARTS_PER_PACKET >= 4
 	if (!portion)
 		return 0;
 	return blocks * (portion + 1) / (HARTS_PER_PACKET + 1);
@@ -210,29 +214,34 @@ CALLBACKS(1)
 #endif
 #if GROUPS > 2
 CALLBACKS(2)
+CALLBACKS(3)
 #endif
-static npu_crypto_xor_fn xor_fn[3] = { xor_0,
+#if GROUPS > 4
+CALLBACKS(4)
+CALLBACKS(5)
+CALLBACKS(6)
+CALLBACKS(7)
+#endif
+static npu_crypto_xor_fn xor_fn[GROUPS] = { xor_0,
 #if GROUPS > 1
  xor_1,
-#else
- xor_0,
 #endif
 #if GROUPS > 2
- xor_2
-#else
- xor_0
+ xor_2, xor_3,
+#endif
+#if GROUPS > 4
+ xor_4, xor_5, xor_6, xor_7,
 #endif
 };
-static npu_crypto_poly_fn poly_fn[3] = { poly_0,
+static npu_crypto_poly_fn poly_fn[GROUPS] = { poly_0,
 #if GROUPS > 1
  poly_1,
-#else
- poly_0,
 #endif
 #if GROUPS > 2
- poly_2
-#else
- poly_0
+ poly_2, poly_3,
+#endif
+#if GROUPS > 4
+ poly_4, poly_5, poly_6, poly_7,
 #endif
 };
 #endif
@@ -270,6 +279,14 @@ static int crypto_request(u32 g, u32 base, u32 len)
 /* Queue 8 is shared by packet leaders. Keep it owned until Linux acks it. */
 static void notify_host(u32 hart)
 {
+u32 pair = hart & 3, side = hart >> 2;
+	notify_pair_want[pair][side] = 1;
+	fence_all();
+	notify_pair_turn[pair] = 1 - side;
+	fence_all();
+	while (notify_pair_want[pair][1 - side] &&
+	       notify_pair_turn[pair] == 1 - side) ;
+	fence_all();
 #ifdef NPU_CRYPTO_QEMU_MAILBOX
 	extern volatile u32 npu_qemu_notify_lock;
 	while (__sync_lock_test_and_set(&npu_qemu_notify_lock, 1)) ;
@@ -291,6 +308,8 @@ static void notify_host(u32 hart)
 #else
 	REG32(HW_MUTEX_REL(hart, off)) = hart << 8;
 #endif
+	fence_all();
+	notify_pair_want[pair][side] = 0;
 }
 static void __attribute__((noreturn)) service_group(u32 g)
 {
@@ -306,6 +325,11 @@ static void __attribute__((noreturn)) service_group(u32 g)
 	for (other = 0; other < GROUPS; other++)
 		for (h = 1; h < HARTS_PER_PACKET; h++)
 			while (!group[other].ready[h]) ;
+	leader_ready[g] = 1;
+	fence_all();
+	for (other = 0; other < GROUPS; other++)
+		while (!leader_ready[other]) ;
+	fence_all();
 	REG32(NPU_MIB31) = CRYPTO_READY;
 	for (;;) {
 		u32 now = REG32(MBQ_CTRL2(queue)), arg, ret, base, t = 0, i;
