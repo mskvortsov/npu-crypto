@@ -16,7 +16,7 @@ $(BUILD):
 	mkdir -p $@
 $(BUILD)/start.o: crypto_standalone/start.S | $(BUILD)
 	$(CC) $(ARCH) -c -o $@ $<
-$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_crypto_config.h npu_regs.h | $(BUILD)
+$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_crypto_config.h npu_crypto_profile.h npu_regs.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(BUILD)/crypto.o: npu_crypto.c npu_crypto.h npu_crypto_config.h npu_types.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<

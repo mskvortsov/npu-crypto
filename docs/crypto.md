@@ -80,13 +80,13 @@ packet. The patch does not cover AmneziaWG.
 The Nokia XG-040G-MD UBI OpenWrt target selects this package and uses a
 crypto-only device tree. Basic firmware, DMA transport and WireGuard traffic have been exercised on hardware; reset and removal behavior remain unverified.
 
-The dedicated firmware stages each request in a 16,460-byte SRAM buffer. It
-copies aligned words from uncached host memory, processes the request in SRAM,
-then copies successful results back and clears the scratch buffer. Requests
-whose header and payload exceed the buffer are rejected for software fallback.
-Run `python3 tests/test_crypto_scratch.py` to test boundary lengths, failure
-without host-buffer modification and scratch clearing; hardware timing and
-DMA behavior are not covered by that test.
+The dedicated firmware processes each request in place in its host DMA bounce
+buffer through the NPU's uncached alias. Linux owns the slot until the NPU
+completes and clears the buffer after copying the result. A timed-out slot is
+quarantined because firmware may still access it. Requests larger than the
+firmware request limit are rejected. Run `python3 tests/test_crypto_scratch.py`
+to test boundary lengths and authentication failure without buffer modification;
+hardware cache and DMA behavior are not covered by that test.
 
 Run `tests/test_crypto_qemu.sh` to exercise the cooperative ChaCha20 path on
 eight emulated RV32 harts with known authenticated ciphertexts, associated
@@ -120,3 +120,37 @@ module was loaded; requests skipped because they are small or NPU use is
 disabled do not increment either counter. Busy counts are requests offered to
 this private algorithm, not a direct measurement of NEON use. Authentication
 failures do not fall back.
+
+### Timing measurements
+
+Timing collection is disabled by default. On a device running matching firmware
+and module versions, enable it and read cumulative per-slot counters with:
+
+```sh
+echo 1 > /sys/module/airoha_npu_crypto/parameters/npu_profile
+cat /sys/kernel/debug/airoha_npu_crypto/profile
+```
+
+Set the parameter to `0` to stop recording. Take snapshots before and after a
+workload and subtract the counts and sums to isolate that workload. Maxima are
+cumulative since driver probe and cannot be subtracted. Divide a sum difference
+by the count difference for the mean per profiled request. Firmware values are
+`mcycle` ticks, and Linux host values are nanoseconds; converting cycles to time
+requires the NPU clock rate. The host measurement covers the transfer function,
+including host copies and polling. Firmware `total` covers request execution but
+excludes mailbox detection and publishing the completion. The leader and wait
+intervals are included in the corresponding ChaCha20 and Poly1305 totals.
+The wait interval begins after the leader's work and ends after every worker
+completes; it is not the sum of worker execution times. Input/output copy and
+scratch clearing are retained as zero-valued counters for comparison with older firmware. Individual firmware intervals use
+32-bit cycle differences, so each interval must be shorter than one counter
+wrap. Profiling adds overhead and snapshots from different slots are not atomic.
+
+Host timing fields break the transfer into `host_copy_in` (request to DMA),
+`host_submit` (DMA write barrier and mailbox writes), `host_poll` (waiting for
+completion), `host_copy_out` (DMA read barrier and result copy), and
+`host_clear` (clearing the DMA request). Poll time includes firmware execution,
+mailbox delivery, polling delays and scheduling; it is not host CPU time or
+pure overhead. Each interval is wall time and may include preemption. Samples
+cover completed transfers; timeouts are not included. The total also includes
+validation and timing overhead, so it need not equal the sum of stage times.

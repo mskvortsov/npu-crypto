@@ -5,7 +5,7 @@
  *   .text + .rodata  → DRAM at 0x84000000  (becomes npu_rv32.bin)
  *   .data            → NPU SRAM at 0x3E900000  (becomes npu_data.bin)
  *   .bss             → NPU SRAM after .data (zeroed by crt0, not in any file)
- *   scratch + stacks → DRAM after .text (not in any file, 16KB per hart)
+ *   stacks           → DRAM after .text (not in any file, 16KB per hart)
  */
 
 OUTPUT_ARCH(riscv)
@@ -51,10 +51,6 @@ SECTIONS
     } > SRAM
 
     ASSERT(__bss_end < ORIGIN(SRAM) + LENGTH(SRAM), "globals exceed physical NPU SRAM")
-
-    .scratch (NOLOAD) : ALIGN(16) {
-        *(.scratch)
-    } > DRAM
 
     .stack (NOLOAD) : ALIGN(16) {
         __stack_base = .;

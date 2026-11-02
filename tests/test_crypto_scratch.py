@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the standalone mailbox buffer copy without NPU MMIO."""
+"""Exercise the in-place mailbox request without NPU MMIO."""
 import ctypes
 import os
 import struct
@@ -25,11 +25,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert request(padded, len(raw)) == 1
         assert padded.raw[76:76 + size] + padded.raw[60:76] == expected
         assert padded.raw[len(raw):len(raw) + 4] == b'\xa5' * 4
-        assert driver.npu_crypto_test_scratch_clear() == 1
         struct.pack_into('<I', padded, 4, 1)
         assert request(padded, len(raw)) == 1
         assert padded.raw[76:76 + size] == data
-        assert driver.npu_crypto_test_scratch_clear() == 1
         # A bad tag must not modify any host buffer byte.
         struct.pack_into('<I', padded, 4, 0)
         assert request(padded, len(raw)) == 1
@@ -38,5 +36,4 @@ with tempfile.TemporaryDirectory() as tmp:
         before = padded.raw
         assert request(padded, len(raw)) == 2
         assert padded.raw == before
-        assert driver.npu_crypto_test_scratch_clear() == 1
-print('Crypto SRAM staging: 13 cases passed')
+print('In-place crypto requests: 13 cases passed')

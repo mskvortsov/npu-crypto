@@ -4,7 +4,7 @@
 
 /* Six compute harts are split evenly across this many packet workers. */
 #ifndef AIROHA_CRYPTO_NPU_BATCH_SIZE
-#define AIROHA_CRYPTO_NPU_BATCH_SIZE 3
+#define AIROHA_CRYPTO_NPU_BATCH_SIZE 1
 #endif
 
 #if AIROHA_CRYPTO_NPU_BATCH_SIZE < 1 || AIROHA_CRYPTO_NPU_BATCH_SIZE > 3

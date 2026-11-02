@@ -2,11 +2,12 @@
  * real service loop on harts 0..5; hart 6 plays the role of the Linux host. */
 #include "npu_crypto.h"
 #include "npu_regs.h"
+#include "npu_crypto_profile.h"
 
 #define READY 0x43525931
 #define ROUNDS 100
 static volatile u32 registers[0x200 / 4];
-struct request { u32 version, op, length, aad_len; u8 nonce[12], key[32], tag[16], data[16384]; };
+struct request { u32 version, op, length, aad_len; u8 nonce[12], key[32], tag[16], data[65536 - 76]; };
 static struct request requests[AIROHA_CRYPTO_NPU_BATCH_SIZE];
 static const u8 expected_tag[16] = { 0xc0,0xbc,0x73,0x67,0xf0,0x09,0xf0,0x2d,0x8e,0xd6,0x51,0x29,0xf5,0x23,0xc5,0x7f };
 
@@ -23,7 +24,7 @@ static void submit(u32 group)
  u32 q = AIROHA_CRYPTO_NPU_QUEUE(group), seq;
  REG32(MBQ_CTRL0(q)) = (u32)&requests[group];
  REG32(MBQ_CTRL1(q)) = 76 + requests[group].aad_len + requests[group].length;
- REG32(MBQ_CTRL3(q)) = 1;
+ REG32(MBQ_CTRL3(q)) = 1 | AIROHA_PROFILE_FLAG;
  fence();
  seq = REG32(MBQ_CTRL2(q));
  REG32(MBQ_CTRL2(q)) = seq + 1;
@@ -36,6 +37,8 @@ static void wait_done(u32 group)
   if (ctrl & 2) {
    fence();
    if (((ctrl >> 2) & 7) != 1) finish(0x13333);
+   if (!((struct airoha_profile_sample *)((u8 *)&requests[group] + AIROHA_PROFILE_OFFSET))->total)
+    finish(0x13333);
    return;
   }
  }

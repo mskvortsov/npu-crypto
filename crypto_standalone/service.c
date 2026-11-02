@@ -2,6 +2,7 @@
 #include "npu_types.h"
 #include "npu_regs.h"
 #include "npu_crypto.h"
+#include "npu_crypto_profile.h"
 
 #define SCRATCH_SIZE (NPU_CRYPTO_MAX_DATA + sizeof(struct npu_crypto_request_aad))
 #define GROUPS AIROHA_CRYPTO_NPU_BATCH_SIZE
@@ -11,7 +12,6 @@
 #define CRYPTO_READY 0x43525931
 
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
-static u32 scratch[1][(SCRATCH_SIZE + 3) / 4];
 static void parallel_xor(u8 *d, const u8 *s, u32 len, const u8 k[32], const u8 iv[12])
 {
 	u32 blocks = len / 64 + !!(len % 64), h;
@@ -45,11 +45,10 @@ struct crypto_group {
 	u32 parts[8][5], powers[8][5];
 	u8 poly_key[32];
 	volatile u32 seq, done[6], ready[6];
+	u32 profiling;
+	struct airoha_profile_sample sample;
 };
 static struct crypto_group group[GROUPS];
-/* Three maximum-sized requests exceed the physical NPU SRAM. */
-static u32 scratch[GROUPS][(SCRATCH_SIZE + 3) / 4]
-	__attribute__((section(".scratch")));
 #if defined(NPU_CRYPTO_QEMU) && !defined(NPU_CRYPTO_QEMU_MAILBOX)
 volatile u32 npu_crypto_qemu_go;
 u32 npu_crypto_qemu_ready(void)
@@ -106,27 +105,43 @@ void __attribute__((noreturn)) crypto_worker(u32 hart)
 }
 static void dispatch(u32 g)
 {
-	u32 seq = group[g].seq + 1, h;
+	u32 seq = group[g].seq + 1, h, start = 0, middle = 0, end;
+	if (group[g].profiling) start = csr_read(mcycle);
 	fence_all();
 	group[g].seq = seq;
 	run_job(g, 0);
+	if (group[g].profiling) middle = csr_read(mcycle);
 	for (h = 1; h < HARTS_PER_PACKET; h++)
 		while (group[g].done[h] != seq) ;
 	fence_all();
+	if (group[g].profiling) {
+		end = csr_read(mcycle);
+		if (group[g].job.type) {
+			group[g].sample.poly_leader += middle - start;
+			group[g].sample.poly_wait += end - middle;
+		} else {
+			group[g].sample.chacha_leader += middle - start;
+			group[g].sample.chacha_wait += end - middle;
+		}
+	}
 }
 static void group_xor(u32 g, u8 *d, const u8 *s, u32 len,
 		      const u8 key[32], const u8 iv[12])
 {
+	u32 start = 0;
 	if (!len) return;
+	if (group[g].profiling) start = csr_read(mcycle);
 	group[g].job.type = 0; group[g].job.dst = d; group[g].job.src = s;
 	group[g].job.key = key; group[g].job.nonce = iv; group[g].job.length = len;
 	group[g].job.blocks = len / 64 + !!(len % 64);
 	dispatch(g);
+	if (group[g].profiling) group[g].sample.chacha += (u32)csr_read(mcycle) - start;
 }
 static void group_poly(u32 g, u8 tag[16], const u8 key[32], const u8 *aad,
 		       u32 aad_len, const u8 *data, u32 len)
 {
-	u32 lengths[8], blocks, h, i;
+	u32 lengths[8], blocks, h, i, start = 0;
+	if (group[g].profiling) start = csr_read(mcycle);
 	for (h = 0; h < 8; h++) lengths[h] = 0;
 	for (i = 0; i < 32; i++) group[g].poly_key[i] = key[i];
 	blocks = aad_len / 16 + !!(aad_len % 16) + len / 16 + !!(len % 16) + 1;
@@ -143,6 +158,7 @@ static void group_poly(u32 g, u8 tag[16], const u8 key[32], const u8 *aad,
 		((volatile u32 *)group[g].parts)[i] = 0;
 		((volatile u32 *)group[g].powers)[i] = 0;
 	}
+	if (group[g].profiling) group[g].sample.poly += (u32)csr_read(mcycle) - start;
 }
 #define CALLBACKS(n) \
 static void xor_##n(u8 *d,const u8 *s,u32 l,const u8 k[32],const u8 iv[12]) \
@@ -182,62 +198,33 @@ static npu_crypto_poly_fn poly_fn[3] = { poly_0,
 };
 #endif
 
-static int copy_request(u32 g, volatile u32 *host, u32 length)
+/* The host retains each DMA slot until completion and clears it afterwards. */
+static int process_request(u32 g, void *buffer, u32 length)
 {
-	volatile u8 *hb = (volatile u8 *)host;
-	u32 *buffer;
-	volatile u32 *clear;
-	u8 *local;
-	u32 words, i;
-	int ret;
-#if !defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU_MAILBOX)
-	/* The NPU harts do not share coherent DRAM caches. Use the host-memory
-	 * alias for every access, including reads and writes by worker harts. */
-	buffer = (u32 *)(((u32)scratch[g] & 0x3fffffff) | 0x40000000);
-#else
-	buffer = scratch[g];
-#endif
-	clear = buffer;
-	local = (u8 *)buffer;
-	if (length < sizeof(struct npu_crypto_request) || length > SCRATCH_SIZE)
-		return 0;
-	words = length / 4;
-	for (i = 0; i < words; i++) buffer[i] = host[i];
-	for (i = words * 4; i < length; i++) local[i] = hb[i];
+ if (length < sizeof(struct npu_crypto_request) || length > SCRATCH_SIZE)
+  return 0;
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
-	ret = npu_crypto_process_with_workers(buffer, length, parallel_xor, parallel_poly);
+ (void)g;
+ return npu_crypto_process_with_workers(buffer, length, parallel_xor, parallel_poly);
 #else
-	ret = npu_crypto_process_with_workers(buffer, length, xor_fn[g], poly_fn[g]);
+ return npu_crypto_process_with_workers(buffer, length, xor_fn[g], poly_fn[g]);
 #endif
-	if (ret == 1) {
-		for (i = 0; i < words; i++) host[i] = buffer[i];
-		for (i = words * 4; i < length; i++) hb[i] = local[i];
-	}
-	for (i = 0; i < (length + 3) / 4; i++) clear[i] = 0;
-	return ret;
 }
 #ifdef NPU_CRYPTO_TEST
-int npu_crypto_test_request(void *host, u32 length) { return copy_request(0, host, length); }
+int npu_crypto_test_request(void *host, u32 length) { return process_request(0, host, length); }
 int npu_crypto_test_request_group(u32 g, void *host, u32 length)
 {
-	if (g >= GROUPS) return 0;
-	return copy_request(g, host, length);
-}
-int npu_crypto_test_scratch_clear(void)
-{
-	u32 i;
-	for (i = 0; i < sizeof(scratch[0]) / sizeof(scratch[0][0]); i++)
-		if (scratch[0][i]) return 0;
-	return 1;
+ if (g >= GROUPS) return 0;
+ return process_request(g, host, length);
 }
 #else
 static int crypto_request(u32 g, u32 base, u32 len)
 {
 #ifdef NPU_CRYPTO_QEMU_MAILBOX
-	return copy_request(g, (volatile u32 *)base, len);
+	return process_request(g, (void *)base, len);
 #else
 	if ((base & 3) || len > 0x40000000 - (base & 0x3fffffff)) return 0;
-	return copy_request(g, (volatile u32 *)((base & 0x3fffffff) | 0x40000000), len);
+	return process_request(g, (void *)((base & 0x3fffffff) | 0x40000000), len);
 #endif
 }
 static void __attribute__((noreturn)) service_group(u32 g)
@@ -256,13 +243,31 @@ static void __attribute__((noreturn)) service_group(u32 g)
 			while (!group[other].ready[h]) ;
 	REG32(NPU_MIB31) = CRYPTO_READY;
 	for (;;) {
-		u32 now = REG32(MBQ_CTRL2(queue)), arg, ret;
+		u32 now = REG32(MBQ_CTRL2(queue)), arg, ret, base, t = 0, i;
 		if (now == seq) continue;
 		seq = now;
 		__asm__ volatile("fence iorw, iorw" ::: "memory");
 		arg = REG32(MBQ_CTRL3(queue)); ret = 0;
+		base = REG32(MBQ_CTRL0(queue));
+		group[g].profiling = !!(arg & AIROHA_PROFILE_FLAG);
+		if (group[g].profiling) {
+			u32 *p = (u32 *)&group[g].sample;
+			for (i = 0; i < sizeof(group[g].sample) / 4; i++) p[i] = 0;
+			t = csr_read(mcycle);
+		}
 		if ((arg & 0x7821) == 1)
-			ret = crypto_request(g, REG32(MBQ_CTRL0(queue)), REG32(MBQ_CTRL1(queue)) & 0xffff);
+			ret = crypto_request(g, base, REG32(MBQ_CTRL1(queue)) & 0xffff);
+		if (group[g].profiling) {
+			volatile u32 *dst;
+			u32 *src = (u32 *)&group[g].sample;
+			group[g].sample.total = (u32)csr_read(mcycle) - t;
+#ifdef NPU_CRYPTO_QEMU_MAILBOX
+			dst = (volatile u32 *)(base + AIROHA_PROFILE_OFFSET);
+#else
+			dst = (volatile u32 *)(((base & 0x3fffffff) | 0x40000000) + AIROHA_PROFILE_OFFSET);
+#endif
+			for (i = 0; i < sizeof(group[g].sample) / 4; i++) dst[i] = src[i];
+		}
 		__asm__ volatile("fence iorw, iorw" ::: "memory");
 		REG32(MBQ_CTRL3(queue)) = (arg & ~0x1cu) | (ret << 2) | 2;
 	}
