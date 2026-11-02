@@ -8,21 +8,38 @@ CFLAGS := $(ARCH) -Os -ffreestanding -fno-builtin -ffunction-sections \
 	-fdata-sections -Wall -Wextra -DAN7581 -DNOWIFI -DNPU_CHACHA_ASM -I.
 LIBGCC := $(shell $(CC) $(ARCH) -print-libgcc-file-name)
 OBJS := $(BUILD)/start.o $(BUILD)/service.o $(BUILD)/crypto.o $(BUILD)/chacha.o
+NPU_POLY1305_ASM ?= 1
+NPU_POLY1305_SRAM ?= 0
+CFLAGS += -DNPU_POLY1305_SRAM=$(NPU_POLY1305_SRAM)
+ifeq ($(NPU_POLY1305_ASM),1)
+CFLAGS += -DNPU_POLY1305_ASM
+OBJS += $(BUILD)/poly1305.o
+endif
 
 .PHONY: all
 all: $(BUILD)/npu_rv32.bin $(BUILD)/npu_data.bin
 
 $(BUILD):
 	mkdir -p $@
+$(BUILD)/poly-config-$(NPU_POLY1305_ASM): | $(BUILD)
+	rm -f $(BUILD)/poly-config-*
+	touch $@
+$(BUILD)/poly-sram-config-$(NPU_POLY1305_SRAM): | $(BUILD)
+	rm -f $(BUILD)/poly-sram-config-*
+	touch $@
 $(BUILD)/start.o: crypto_standalone/start.S | $(BUILD)
 	$(CC) $(ARCH) -c -o $@ $<
-$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_crypto_config.h npu_crypto_profile.h npu_regs.h | $(BUILD)
+$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_crypto_config.h npu_crypto_profile.h npu_regs.h $(BUILD)/poly-sram-config-$(NPU_POLY1305_SRAM) | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(BUILD)/crypto.o: npu_crypto.c npu_crypto.h npu_crypto_config.h npu_types.h | $(BUILD)
+$(BUILD)/crypto.o: npu_crypto.c npu_crypto.h npu_crypto_config.h npu_types.h $(BUILD)/poly-config-$(NPU_POLY1305_ASM) | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(BUILD)/chacha.S: crypto_standalone/cryptogams/chacha-riscv.pl | $(BUILD)
 	perl $< generic > $@
 $(BUILD)/chacha.o: $(BUILD)/chacha.S
+	$(CC) $(ARCH) -c -o $@ $<
+$(BUILD)/poly1305.S: crypto_standalone/cryptogams/poly1305-riscv.pl | $(BUILD)
+	perl $< 32 $@
+$(BUILD)/poly1305.o: $(BUILD)/poly1305.S
 	$(CC) $(ARCH) -c -o $@ $<
 $(BUILD)/firmware.elf: $(OBJS) link.ld
 	$(LD) -m elf32lriscv -T link.ld --defsym=__ndbg_base=0x3e90f000 \

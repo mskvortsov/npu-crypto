@@ -10,6 +10,10 @@
 #define ACTIVE_HARTS 6
 #define WORKERS_START 0x43525731
 #define CRYPTO_READY 0x43525931
+#ifndef NPU_POLY1305_SRAM
+#define NPU_POLY1305_SRAM 0
+#endif
+#define POLY_SCRATCH_BYTES 512
 
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
 static void parallel_xor(u8 *d, const u8 *s, u32 len, const u8 k[32], const u8 iv[12])
@@ -49,6 +53,9 @@ struct crypto_group {
 	struct airoha_profile_sample sample;
 };
 static struct crypto_group group[GROUPS];
+#if NPU_POLY1305_SRAM
+static u32 poly_scratch[ACTIVE_HARTS][POLY_SCRATCH_BYTES / sizeof(u32)];
+#endif
 #if defined(NPU_CRYPTO_QEMU) && !defined(NPU_CRYPTO_QEMU_MAILBOX)
 volatile u32 npu_crypto_qemu_go;
 u32 npu_crypto_qemu_ready(void)
@@ -63,6 +70,22 @@ u32 npu_crypto_qemu_ready(void)
 }
 #endif
 static void fence_all(void) { __asm__ volatile("fence rw, rw" ::: "memory"); }
+/* The first portion does not calculate a power. Tune its share for the
+ * number of harts, accounting for that extra work on the other portions. */
+static u32 poly_boundary(u32 blocks, u32 portion)
+{
+#if HARTS_PER_PACKET == 6
+	if (!portion)
+		return 0;
+	return blocks * (portion + 1) / (HARTS_PER_PACKET + 1);
+#elif HARTS_PER_PACKET == 2
+	if (!portion)
+		return 0;
+	return portion == 1 ? blocks * 3 / 5 : blocks;
+#else
+	return blocks * portion / HARTS_PER_PACKET;
+#endif
+}
 static void run_job(u32 g, u32 local)
 {
 	volatile struct crypto_job *j = &group[g].job;
@@ -72,9 +95,25 @@ static void run_job(u32 g, u32 local)
 		npu_chacha20_xor_range(j->dst, j->src, j->length, j->key,
 				       j->nonce, first, end);
 	else {
+		first = poly_boundary(j->blocks, local);
+		end = poly_boundary(j->blocks, local + 1);
+#if NPU_POLY1305_SRAM
+		{
+			u32 *scratch = poly_scratch[g * HARTS_PER_PACKET + local];
+			u32 i;
+			npu_poly1305_segment_buffered(group[g].parts[local], j->key,
+				j->aad, j->aad_length, j->src, j->length, first, end,
+				scratch, POLY_SCRATCH_BYTES);
+			for (i = 0; i < POLY_SCRATCH_BYTES / sizeof(u32); i++)
+				((volatile u32 *)scratch)[i] = 0;
+		}
+#else
 		npu_poly1305_segment(group[g].parts[local], j->key, j->aad,
 				     j->aad_length, j->src, j->length, first, end);
-		npu_poly1305_power(group[g].powers[local], j->key, end - first);
+#endif
+		/* The combiner starts with portion zero and never uses r^len[0]. */
+		if (local)
+			npu_poly1305_power(group[g].powers[local], j->key, end - first);
 	}
 }
 void __attribute__((noreturn)) crypto_worker(u32 hart)
@@ -146,7 +185,7 @@ static void group_poly(u32 g, u8 tag[16], const u8 key[32], const u8 *aad,
 	for (i = 0; i < 32; i++) group[g].poly_key[i] = key[i];
 	blocks = aad_len / 16 + !!(aad_len % 16) + len / 16 + !!(len % 16) + 1;
 	for (h = 0; h < HARTS_PER_PACKET; h++)
-		lengths[h] = blocks * (h + 1) / HARTS_PER_PACKET - blocks * h / HARTS_PER_PACKET;
+		lengths[h] = poly_boundary(blocks, h + 1) - poly_boundary(blocks, h);
 	group[g].job.type = 1; group[g].job.key = group[g].poly_key;
 	group[g].job.aad = aad; group[g].job.aad_length = aad_len;
 	group[g].job.src = data; group[g].job.length = len; group[g].job.blocks = blocks;
@@ -227,6 +266,32 @@ static int crypto_request(u32 g, u32 base, u32 len)
 	return process_request(g, (void *)((base & 0x3fffffff) | 0x40000000), len);
 #endif
 }
+
+/* Queue 8 is shared by packet leaders. Keep it owned until Linux acks it. */
+static void notify_host(u32 hart)
+{
+#ifdef NPU_CRYPTO_QEMU_MAILBOX
+	extern volatile u32 npu_qemu_notify_lock;
+	while (__sync_lock_test_and_set(&npu_qemu_notify_lock, 1)) ;
+#else
+	u32 off = (30 * 4) & HW_MUTEX_OFF_MASK, status;
+	do {
+		REG32(HW_MUTEX_ACQ(off)) = (hart << 8) | 0x40;
+		status = REG32(HW_MUTEX_STATUS(hart, off));
+	} while (!(status & HW_MUTEX_HELD) || ((status >> 8) & 0xff) != hart);
+#endif
+	REG32(MBQ_CTRL0(MBQ_NOTIFY)) = hart;
+	REG32(MBQ_CTRL1(MBQ_NOTIFY)) = 0;
+	REG32(MBQ_CTRL3(MBQ_NOTIFY)) = 0;
+	__asm__ volatile("fence iorw, iorw" ::: "memory");
+	REG32(MBQ_CTRL2(MBQ_NOTIFY)) = REG32(MBQ_CTRL2(MBQ_NOTIFY)) + 1;
+	while (!(REG32(MBQ_CTRL3(MBQ_NOTIFY)) & 2)) ;
+#ifdef NPU_CRYPTO_QEMU_MAILBOX
+	__sync_lock_release(&npu_qemu_notify_lock);
+#else
+	REG32(HW_MUTEX_REL(hart, off)) = hart << 8;
+#endif
+}
 static void __attribute__((noreturn)) service_group(u32 g)
 {
 	u32 queue = AIROHA_CRYPTO_NPU_QUEUE(g);
@@ -270,6 +335,10 @@ static void __attribute__((noreturn)) service_group(u32 g)
 		}
 		__asm__ volatile("fence iorw, iorw" ::: "memory");
 		REG32(MBQ_CTRL3(queue)) = (arg & ~0x1cu) | (ret << 2) | 2;
+		if (arg & AIROHA_INTERRUPT_FLAG) {
+			__asm__ volatile("fence iorw, iorw" ::: "memory");
+			notify_host(g * HARTS_PER_PACKET);
+		}
 	}
 }
 void __attribute__((noreturn)) crypto_service(u32 hart)

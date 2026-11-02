@@ -154,3 +154,17 @@ mailbox delivery, polling delays and scheduling; it is not host CPU time or
 pure overhead. Each interval is wall time and may include preemption. Samples
 cover completed transfers; timeouts are not included. The total also includes
 validation and timing overhead, so it need not equal the sum of stage times.
+
+The `npu_interrupt` module parameter selects completion handling: `1` uses the
+queue 8 host interrupt (default), and `0` uses the previous polling path. Each
+request keeps the mode selected when it was submitted. The startup self-test
+checks that the expected completion interrupts are delivered when interrupt
+mode is enabled. `host_poll` in the profile is the completion-wait interval in
+either mode; in interrupt mode it includes interrupt delivery and scheduling.
+
+The dedicated firmware uses the Cryptogams scalar RV32 Poly1305 block routine
+by default. Its accumulator is converted for the existing parallel combiner;
+unaligned input is copied in 16-byte chunks to avoid reads outside the input.
+Build the firmware with `NPU_POLY1305_ASM=0` to use the portable C segment
+backend. The QEMU suite runs both backends for every batch size. QEMU validates
+correctness but does not predict AN7581 performance.

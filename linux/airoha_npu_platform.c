@@ -5,6 +5,7 @@
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
@@ -12,6 +13,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/ktime.h>
+#include <linux/wait.h>
 #include "airoha_npu_crypto_proto.h"
 #include "airoha_npu_engine.h"
 #include "airoha_npu_test_vector.h"
@@ -27,6 +29,10 @@
 #define NPU_MBOX_CTRL1(q) (0x30c034 + (q) * 0x10)
 #define NPU_MBOX_CTRL2(q) (0x30c038 + (q) * 0x10)
 #define NPU_MBOX_CTRL3(q) (0x30c03c + (q) * 0x10)
+#define NPU_MBOX_INT_STATUS 0x30c000
+#define NPU_MBOX_INT_MASK0 0x30c004
+#define NPU_MBOX_HOST_BIT BIT(8)
+#define NPU_MBOX_NOTIFY 8
 #define NPU_MIB30 0x30c1b8
 #define NPU_MIB31 0x30c1bc
 #define NPU_READY 0x43525931
@@ -39,6 +45,9 @@
 static bool npu_profile;
 module_param(npu_profile, bool, 0644);
 MODULE_PARM_DESC(npu_profile, "Collect NPU timing samples (default: false)");
+static bool npu_interrupt = true;
+module_param(npu_interrupt, bool, 0644);
+MODULE_PARM_DESC(npu_interrupt, "Use mailbox completion interrupts (default: true)");
 
 struct airoha_profile_aggregate {
 	u64 count, host_ns_sum, host_ns_max;
@@ -62,7 +71,25 @@ struct airoha_crypto_dev {
 	spinlock_t profile_lock;
 	struct airoha_profile_aggregate profile[AIROHA_CRYPTO_NPU_BATCH_SIZE];
 	struct dentry *profile_dir;
+	wait_queue_head_t completion_wait;
+	atomic_t irq_count;
 };
+
+static irqreturn_t airoha_crypto_irq(int irq, void *data)
+{
+	struct airoha_crypto_dev *npu = data;
+	u32 ctrl;
+
+	if (!(readl(npu->regs + NPU_MBOX_INT_STATUS) & NPU_MBOX_HOST_BIT))
+		return IRQ_NONE;
+	writel(NPU_MBOX_HOST_BIT, npu->regs + NPU_MBOX_INT_STATUS);
+	ctrl = readl(npu->regs + NPU_MBOX_CTRL3(NPU_MBOX_NOTIFY));
+	writel((ctrl & ~(NPU_STATUS_MASK << 2)) | NPU_DONE,
+	       npu->regs + NPU_MBOX_CTRL3(NPU_MBOX_NOTIFY));
+	atomic_inc(&npu->irq_count);
+	wake_up_all(&npu->completion_wait);
+	return IRQ_HANDLED;
+}
 
 static int airoha_profile_show(struct seq_file *s, void *unused)
 {
@@ -121,6 +148,7 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 	unsigned int queue = AIROHA_CRYPTO_NPU_QUEUE(slot);
 	u32 ctrl, seq;
 	bool profile = READ_ONCE(npu_profile);
+	bool use_irq = READ_ONCE(npu_interrupt);
 	u64 started = profile ? ktime_get_ns() : 0;
 	u64 t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
 	int ret;
@@ -141,12 +169,20 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 	dma_wmb();
 	writel(lower_32_bits(dma), npu->regs + NPU_MBOX_CTRL0(queue));
 	writel(len, npu->regs + NPU_MBOX_CTRL1(queue));
-	writel(NPU_WAIT | (profile ? AIROHA_PROFILE_FLAG : 0), npu->regs + NPU_MBOX_CTRL3(queue));
+	writel(NPU_WAIT | (profile ? AIROHA_PROFILE_FLAG : 0) |
+	       (use_irq ? AIROHA_INTERRUPT_FLAG : 0), npu->regs + NPU_MBOX_CTRL3(queue));
 	seq = readl(npu->regs + NPU_MBOX_CTRL2(queue));
 	writel(seq + 1, npu->regs + NPU_MBOX_CTRL2(queue));
 	if (profile) t2 = ktime_get_ns();
-	ret = readl_poll_timeout(npu->regs + NPU_MBOX_CTRL3(queue), ctrl,
-				 ctrl & NPU_DONE, 10, NPU_TIMEOUT_US);
+	if (use_irq) {
+		ret = wait_event_timeout(npu->completion_wait,
+					 (readl(npu->regs + NPU_MBOX_CTRL3(queue)) & NPU_DONE),
+					 usecs_to_jiffies(NPU_TIMEOUT_US)) ? 0 : -ETIMEDOUT;
+		ctrl = readl(npu->regs + NPU_MBOX_CTRL3(queue));
+	} else {
+		ret = readl_poll_timeout(npu->regs + NPU_MBOX_CTRL3(queue), ctrl,
+					 ctrl & NPU_DONE, 10, NPU_TIMEOUT_US);
+	}
 	if (ret) {
 		/* The hart can still access this buffer after a timeout. */
 		WRITE_ONCE(npu->poisoned, true);
@@ -246,6 +282,14 @@ next:
 		if (READ_ONCE(npu->poisoned))
 			break;
 	}
+	if (!ret && READ_ONCE(npu_interrupt) &&
+	    !wait_event_timeout(npu->completion_wait,
+			atomic_read(&npu->irq_count) >= 2 * AIROHA_CRYPTO_NPU_BATCH_SIZE,
+			usecs_to_jiffies(NPU_TIMEOUT_US))) {
+		dev_err(npu->dev, "selftest did not receive all completion interrupts\n");
+		WRITE_ONCE(npu->poisoned, true);
+		ret = -ETIMEDOUT;
+	}
 	kfree_sensitive(req);
 	return ret;
 }
@@ -295,7 +339,7 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct airoha_crypto_transport transport;
 	struct airoha_crypto_dev *npu;
-	int ret;
+	int ret, irq;
 
 	if (airoha_crypto_has_network_consumer(dev->of_node))
 		return dev_err_probe(dev, -EBUSY,
@@ -305,9 +349,17 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	npu->dev = dev;
 	spin_lock_init(&npu->profile_lock);
+	init_waitqueue_head(&npu->completion_wait);
 	npu->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(npu->regs))
 		return PTR_ERR(npu->regs);
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
+	ret = devm_request_irq(dev, irq, airoha_crypto_irq, IRQF_SHARED,
+			       "airoha-npu-crypto", npu);
+	if (ret)
+		return ret;
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
@@ -324,6 +376,8 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 		ret = -ERANGE;
 		goto free_dma;
 	}
+	writel(NPU_MBOX_HOST_BIT, npu->regs + NPU_MBOX_INT_STATUS);
+	writel(NPU_MBOX_HOST_BIT, npu->regs + NPU_MBOX_INT_MASK0);
 	ret = airoha_crypto_boot(pdev, npu);
 	if (ret)
 		goto free_dma;
@@ -342,6 +396,7 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	debugfs_create_file("profile", 0444, npu->profile_dir, npu, &airoha_profile_fops);
 	return 0;
 free_dma:
+	writel(0, npu->regs + NPU_MBOX_INT_MASK0);
 	if (READ_ONCE(npu->poisoned)) {
 		dev_err(dev, "retaining DMA buffer: firmware may still access it\n");
 		return ret;
@@ -359,6 +414,7 @@ static void airoha_crypto_remove(struct platform_device *pdev)
 
 	debugfs_remove_recursive(npu->profile_dir);
 	airoha_crypto_engine_unregister(npu->engine);
+	writel(0, npu->regs + NPU_MBOX_INT_MASK0);
 	if (READ_ONCE(npu->poisoned)) {
 		dev_err(npu->dev, "retaining DMA buffer: firmware may still access it\n");
 		return;

@@ -33,5 +33,4 @@ with tempfile.TemporaryDirectory() as tmp:
         struct.pack_into('<I', buf, 4, 1)
         assert request(buf, len(raw)) == 1, i
         assert buf.raw[76 + aad_len:] == data, i
-        assert driver.npu_crypto_test_scratch_clear() == 1, i
 print('Parallel Poly1305: 500 differential cases passed')

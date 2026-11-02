@@ -312,25 +312,109 @@ static void clear_bytes(void *p, u32 len)
 		*v++ = 0;
 }
 
-void npu_poly1305_segment(u32 out[5], const u8 key[32], const u8 *aad,
-			  u32 aad_len, const u8 *data, u32 len,
-			  u32 first, u32 end)
+#ifdef NPU_POLY1305_ASM
+/* Cryptogams RV32 uses four 32-bit words plus a high word for h, while the
+ * parallel combiner uses five radix-2^26 limbs. */
+struct segment_poly { u32 words[12]; };
+extern int poly1305_init(void *ctx, const u8 key[16]);
+extern void poly1305_blocks(void *ctx, const u8 *input, u32 len, u32 padbit);
+static void segment_init(struct segment_poly *st, const u8 *key)
 {
-	struct poly1305_internal poly;
+	/* The generator's unaligned-key path reads beyond the key. */
+	u32 aligned_key[4];
+	u32 i;
+	for (i = 0; i < 16; i++) ((u8 *)aligned_key)[i] = key[i];
+	poly1305_init(st, (const u8 *)aligned_key);
+	clear_bytes(aligned_key, sizeof(aligned_key));
+}
+static void segment_blocks(struct segment_poly *st, const u8 *p, u32 len)
+{
+	if (((unsigned long)p & 3) == 0) {
+		poly1305_blocks(st, p, len, 1);
+	} else {
+		/* Avoid the assembly's aligned-down reads outside the input. */
+		u32 block[4], i;
+		while (len) {
+			for (i = 0; i < 16; i++) ((u8 *)block)[i] = p[i];
+			poly1305_blocks(st, (const u8 *)block, 16, 1);
+			p += 16; len -= 16;
+		}
+		clear_bytes(block, sizeof(block));
+	}
+}
+static void segment_result(struct segment_poly *st, u32 out[5])
+{
+	u32 *h = st->words, carry, i;
+	u64 sum;
+	/* The assembly leaves the top word partially reduced. Fold all bits
+	 * above bit 129 using 2^130 == 5 (mod 2^130 - 5). */
+	sum = (u64)h[0] + (u64)(h[4] >> 2) * 5;
+	h[0] = (u32)sum;
+	carry = sum >> 32;
+	for (i = 1; i < 4; i++) {
+		sum = (u64)h[i] + carry;
+		h[i] = (u32)sum;
+		carry = sum >> 32;
+	}
+	h[4] = (h[4] & 3) + carry;
+	out[0] = h[0] & 0x3ffffff;
+	out[1] = ((h[0] >> 26) | (h[1] << 6)) & 0x3ffffff;
+	out[2] = ((h[1] >> 20) | (h[2] << 12)) & 0x3ffffff;
+	out[3] = ((h[2] >> 14) | (h[3] << 18)) & 0x3ffffff;
+	out[4] = (h[3] >> 8) | (h[4] << 24);
+}
+#else
+struct segment_poly { struct poly1305_internal poly; };
+static void segment_init(struct segment_poly *st, const u8 *key)
+{ poly1305_init_generic(&st->poly, key); }
+static void segment_blocks(struct segment_poly *st, const u8 *p, u32 len)
+{ poly1305_blocks_generic(&st->poly, p, len, 1); }
+static void segment_result(struct segment_poly *st, u32 out[5])
+{ u32 i; for (i = 0; i < 5; i++) out[i] = st->poly.h[i]; }
+#endif
+
+static void segment_data(struct segment_poly *poly, const u8 *src, u32 len,
+			 u32 *scratch, u32 scratch_len)
+{
+	u32 count, i;
+	if (!scratch || scratch_len < 16) {
+		segment_blocks(poly, src, len);
+		return;
+	}
+	scratch_len &= ~15u;
+	while (len) {
+		count = len < scratch_len ? len : scratch_len;
+		if (!((unsigned long)src & 3)) {
+			const u32 *words = (const u32 *)src;
+			for (i = 0; i < count / 4; i++) scratch[i] = words[i];
+		} else {
+			for (i = 0; i < count; i++) ((u8 *)scratch)[i] = src[i];
+		}
+		segment_blocks(poly, (const u8 *)scratch, count);
+		src += count;
+		len -= count;
+	}
+}
+
+void npu_poly1305_segment_buffered(u32 out[5], const u8 key[32], const u8 *aad,
+				   u32 aad_len, const u8 *data, u32 len,
+				   u32 first, u32 end, u32 *scratch,
+				   u32 scratch_len)
+{
+	struct segment_poly poly;
 	u8 block[16];
 	u32 aad_blocks = aad_len / 16 + !!(aad_len % 16);
 	u32 data_blocks = len / 16 + !!(len % 16);
 	u32 index, offset, count, i;
 	const u8 *src;
 
-	poly1305_init_generic(&poly, key);
+	segment_init(&poly, key);
 	for (index = first; index < end;) {
 		if (index < aad_len / 16) {
 			count = aad_len / 16 - index;
 			if (count > end - index)
 				count = end - index;
-			poly1305_blocks_generic(&poly, aad + index * 16,
-						count * 16, 1);
+			segment_blocks(&poly, aad + index * 16, count * 16);
 			index += count;
 			continue;
 		}
@@ -340,8 +424,8 @@ void npu_poly1305_segment(u32 out[5], const u8 key[32], const u8 *aad,
 			count = len / 16 - offset;
 			if (count > end - index)
 				count = end - index;
-			poly1305_blocks_generic(&poly, data + offset * 16,
-						count * 16, 1);
+			segment_data(&poly, data + offset * 16, count * 16,
+				     scratch, scratch_len);
 			index += count;
 			continue;
 		}
@@ -365,13 +449,20 @@ void npu_poly1305_segment(u32 out[5], const u8 key[32], const u8 *aad,
 			count = 16;
 		for (i = 0; i < count; i++)
 			block[i] = src[i];
-		poly1305_blocks_generic(&poly, block, 16, 1);
+		segment_blocks(&poly, block, 16);
 		index++;
 	}
-	for (i = 0; i < 5; i++)
-		out[i] = poly.h[i];
+	segment_result(&poly, out);
 	clear_bytes(&poly, sizeof(poly));
 	clear_bytes(block, sizeof(block));
+}
+
+void npu_poly1305_segment(u32 out[5], const u8 key[32], const u8 *aad,
+			  u32 aad_len, const u8 *data, u32 len,
+			  u32 first, u32 end)
+{
+	npu_poly1305_segment_buffered(out, key, aad, aad_len, data, len,
+				      first, end, 0, 0);
 }
 
 /* Multiply two field elements using the existing Poly1305 block operation. */

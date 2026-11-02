@@ -4,6 +4,7 @@
 /* The final 256 bytes of each 64 KiB bounce slot are reserved for profiling. */
 #define AIROHA_PROFILE_OFFSET 65280
 #define AIROHA_PROFILE_FLAG 0x40
+#define AIROHA_INTERRUPT_FLAG 0x80
 #define AIROHA_PROFILE_FIELDS(X) \
  X(total) X(input_copy) X(output_copy) X(clear) \
  X(chacha) X(chacha_leader) X(chacha_wait) \

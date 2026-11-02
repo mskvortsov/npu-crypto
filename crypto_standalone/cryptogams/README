@@ -1,3 +1,4 @@
 ChaCha20 RISC-V generator from CRYPTOGAMS commit 4acc4a3.
+Poly1305 RISC-V generator copied from /w/ClankerNPU/cryptogams/riscv.
 The scalar epilogue clears its 64-byte state buffer before returning.
 See LICENSE in this directory for redistribution terms.

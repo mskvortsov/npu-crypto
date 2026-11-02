@@ -17,6 +17,10 @@ typedef void (*npu_crypto_poly_fn)(u8 tag[16], const u8 key[32],
 void npu_poly1305_segment(u32 out[5], const u8 key[32], const u8 *aad,
 			  u32 aad_len, const u8 *data, u32 len,
 			  u32 first, u32 end);
+void npu_poly1305_segment_buffered(u32 out[5], const u8 key[32], const u8 *aad,
+				   u32 aad_len, const u8 *data, u32 len,
+				   u32 first, u32 end, u32 *scratch,
+				   u32 scratch_len);
 void npu_poly1305_power(u32 out[5], const u8 key[32], u32 exponent);
 void npu_poly1305_combine(u8 tag[16], const u8 key[32],
 			  const u32 parts[8][5], const u32 powers[8][5],
