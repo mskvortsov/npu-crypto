@@ -1,0 +1,20 @@
+From: OpenWrt Airoha maintainers <openwrt-devel@lists.openwrt.org>
+Subject: [PATCH] crypto: select crypto engine for Airoha NPU offload
+
+Provide a target-selectable option for the Airoha NPU offload driver.
+The crypto engine symbol is hidden and must be selected by another symbol.
+
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -269,6 +269,11 @@ config CRYPTO_SIMD
+ 	tristate
+ 	select CRYPTO_CRYPTD
+ 
++config CRYPTO_DEV_AIROHA_NPU
++	bool "Airoha NPU crypto offload support"
++	depends on ARCH_AIROHA
++	select CRYPTO_ENGINE
++
+ config CRYPTO_ENGINE
+ 	tristate
+ 

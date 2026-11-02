@@ -1,0 +1,119 @@
+diff --git a/drivers/net/wireguard/npu_crypto.h b/drivers/net/wireguard/npu_crypto.h
+new file mode 100644
+index 0000000..8fbfff8
+--- /dev/null
++++ b/drivers/net/wireguard/npu_crypto.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef WG_NPU_CRYPTO_H
++#define WG_NPU_CRYPTO_H
++
++#include <crypto/aead.h>
++#include <linux/crypto.h>
++#include <linux/unaligned.h>
++
++/* Called by the per-device crypt workers, which can sleep. */
++static int wg_npu_crypt(struct scatterlist *sg, size_t len, u64 counter,
++			const u8 key[32], bool decrypt)
++{
++	DECLARE_CRYPTO_WAIT(wait);
++	struct crypto_aead *tfm;
++	struct aead_request *req;
++	u8 iv[12] = { 0 };
++	int ret;
++
++	tfm = crypto_alloc_aead("airoha-npu-chacha20poly1305", 0, 0);
++	if (IS_ERR(tfm))
++		return -EOPNOTSUPP;
++	ret = crypto_aead_setkey(tfm, key, 32);
++	if (ret)
++		goto free_tfm;
++	ret = crypto_aead_setauthsize(tfm, 16);
++	if (ret)
++		goto free_tfm;
++	req = aead_request_alloc(tfm, GFP_KERNEL);
++	if (!req) {
++		ret = -ENOMEM;
++		goto free_tfm;
++	}
++	put_unaligned_le64(counter, iv + 4);
++	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP |
++				  CRYPTO_TFM_REQ_MAY_BACKLOG,
++				  crypto_req_done, &wait);
++	aead_request_set_ad(req, 0);
++	aead_request_set_crypt(req, sg, sg, len, iv);
++	ret = crypto_wait_req(decrypt ? crypto_aead_decrypt(req) :
++				       crypto_aead_encrypt(req), &wait);
++	aead_request_free(req);
++free_tfm:
++	crypto_free_aead(tfm);
++	return ret;
++}
++
++#endif
+diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
+index eb88511..5226a3c 100644
+--- a/drivers/net/wireguard/receive.c
++++ b/drivers/net/wireguard/receive.c
+@@ -10,6 +10,7 @@
+ #include "messages.h"
+ #include "cookie.h"
+ #include "socket.h"
++#include "npu_crypto.h"
+ 
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+@@ -244,7 +245,7 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
+ 	struct sk_buff *trailer;
+ 	unsigned int offset;
+-	int num_frags;
++	int num_frags, npu_ret;
+ 
+ 	if (unlikely(!keypair))
+ 		return false;
+@@ -275,7 +276,11 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ 	if (skb_to_sgvec(skb, sg, 0, skb->len) <= 0)
+ 		return false;
+ 
+-	if (!chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
++	npu_ret = wg_npu_crypt(sg, skb->len, PACKET_CB(skb)->nonce,
++			       keypair->receiving.key, true);
++	if (npu_ret == -EBADMSG)
++		return false;
++	if (npu_ret && !chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
+ 					         PACKET_CB(skb)->nonce,
+ 						 keypair->receiving.key))
+ 		return false;
+diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
+index 67d0147..769f9b0 100644
+--- a/drivers/net/wireguard/send.c
++++ b/drivers/net/wireguard/send.c
+@@ -10,6 +10,7 @@
+ #include "socket.h"
+ #include "messages.h"
+ #include "cookie.h"
++#include "npu_crypto.h"
+ 
+ #include <linux/uio.h>
+ #include <linux/inetdevice.h>
+@@ -165,7 +166,7 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ 	struct scatterlist sg[MAX_SKB_FRAGS + 8];
+ 	struct message_data *header;
+ 	struct sk_buff *trailer;
+-	int num_frags;
++	int num_frags, npu_ret;
+ 
+ 	/* Force hash calculation before encryption so that flow analysis is
+ 	 * consistent over the inner packet.
+@@ -213,6 +214,10 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ 	if (skb_to_sgvec(skb, sg, sizeof(struct message_data),
+ 			 noise_encrypted_len(plaintext_len)) <= 0)
+ 		return false;
++	npu_ret = wg_npu_crypt(sg, plaintext_len, PACKET_CB(skb)->nonce,
++			       keypair->sending.key, false);
++	if (!npu_ret)
++		return true;
+ 	return chacha20poly1305_encrypt_sg_inplace(sg, plaintext_len, NULL, 0,
+ 						   PACKET_CB(skb)->nonce,
+ 						   keypair->sending.key);

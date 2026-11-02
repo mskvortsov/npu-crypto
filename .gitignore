@@ -1,0 +1,11 @@
+/build/
+__pycache__/
+*.pyc
+/linux/*.o
+/linux/*.ko
+/linux/*.mod
+/linux/*.mod.c
+/linux/.*.cmd
+/linux/Module.symvers
+/linux/modules.order
+/openwrt/package/kernel/airoha-npu-crypto
