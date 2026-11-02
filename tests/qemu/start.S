@@ -16,7 +16,8 @@ _start:
 	bnez t0, 1f
 	call test_main
 1:
-	call crypto_worker
+	mv a0, t0
+	call qemu_hart_entry
 2:
 	wfi
 	j 2b

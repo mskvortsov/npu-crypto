@@ -3,7 +3,12 @@
 
 #include "npu_types.h"
 
+#ifdef NPU_CRYPTO_QEMU_MAILBOX
+volatile u32 *npu_crypto_qemu_reg(u32 addr);
+#define REG32(addr) (*npu_crypto_qemu_reg(addr))
+#else
 #define REG32(addr) (*(volatile u32 *)(addr))
+#endif
 
 /* SoC identification */
 #define CHIP_ID_REG             0x1FB00064

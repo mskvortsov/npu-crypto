@@ -5,7 +5,7 @@
  *   .text + .rodata  → DRAM at 0x84000000  (becomes npu_rv32.bin)
  *   .data            → NPU SRAM at 0x3E900000  (becomes npu_data.bin)
  *   .bss             → NPU SRAM after .data (zeroed by crt0, not in any file)
- *   stacks           → DRAM after .text (not in any file, 16KB per hart)
+ *   scratch + stacks → DRAM after .text (not in any file, 16KB per hart)
  */
 
 OUTPUT_ARCH(riscv)
@@ -14,7 +14,7 @@ ENTRY(_start)
 MEMORY
 {
     DRAM (rwx)  : ORIGIN = 0x84000000, LENGTH = 2M
-    SRAM (rw)   : ORIGIN = 0x3E900000, LENGTH = 64K
+    SRAM (rw)   : ORIGIN = 0x3E900000, LENGTH = 32K
 }
 
 SECTIONS
@@ -50,8 +50,11 @@ SECTIONS
         __bss_end = . - 4;
     } > SRAM
 
-    /* the debug block sits at a fixed address above the globals */
-    ASSERT(__bss_end < __ndbg_base, "globals overlap the debug block")
+    ASSERT(__bss_end < ORIGIN(SRAM) + LENGTH(SRAM), "globals exceed physical NPU SRAM")
+
+    .scratch (NOLOAD) : ALIGN(16) {
+        *(.scratch)
+    } > DRAM
 
     .stack (NOLOAD) : ALIGN(16) {
         __stack_base = .;

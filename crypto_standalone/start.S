@@ -20,7 +20,7 @@ _start:
 	li t1, 0x4000
 	mul t1, t0, t1
 	add sp, sp, t1
-	bnez t0, .Lworker
+	bnez t0, .Lrun
 	la t0, __bss_start
 	la t1, __bss_end
 	addi t1, t1, 4
@@ -30,10 +30,8 @@ _start:
 	addi t0, t0, 4
 	j .Lzero
 .Lrun:
+	csrr a0, mhartid
 	call crypto_service
-.Lworker:
-	mv a0, t0
-	call crypto_worker
 .Lpark:
 	wfi
 	j .Lpark

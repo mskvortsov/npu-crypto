@@ -1,36 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include <crypto/engine.h>
 #include <crypto/internal/aead.h>
 #include <linux/atomic.h>
 #include <linux/err.h>
 #include <linux/completion.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/refcount.h>
+#include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include "airoha_npu_crypto_proto.h"
 #include "airoha_npu_engine.h"
 
 #define AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE 1024
 
 struct airoha_crypto_engine {
-	struct aead_engine_alg alg;
-	struct crypto_engine *engine;
+	struct aead_alg alg;
+	struct workqueue_struct *workqueue;
 	struct airoha_crypto_transport transport;
 	refcount_t references;
 	struct completion released;
 	spinlock_t lock;
-	atomic_t in_flight;
+	atomic_t slots_in_use;
+	struct list_head pending;
 	bool stopping;
 };
 
 static atomic64_t npu_submitted = ATOMIC64_INIT(0);
 static atomic64_t npu_busy = ATOMIC64_INIT(0);
 static bool npu_enable = true;
+static bool npu_fallback = true;
 
 module_param(npu_enable, bool, 0644);
 MODULE_PARM_DESC(npu_enable,
 		 "Enable NPU offload above the minimum payload size (default: true)");
+module_param(npu_fallback, bool, 0644);
+MODULE_PARM_DESC(npu_fallback,
+		 "Use software/NEON fallback when all NPU packet slots are busy (default: true)");
 
 static int airoha_counter_get(char *buffer, const struct kernel_param *param)
 {
@@ -52,14 +59,21 @@ struct airoha_crypto_ctx {
 	u8 key[32];
 };
 
-struct airoha_crypto_reqctx {
+struct airoha_crypto_work {
+	struct work_struct work;
+	struct list_head pending;
+	struct rcu_head rcu;
+	struct aead_request *req;
+	unsigned int slot;
 	bool decrypt;
 };
+
+static void airoha_do_work(struct work_struct *work);
 
 static struct airoha_crypto_engine *engine_from_tfm(struct crypto_aead *tfm)
 {
 	return container_of(crypto_aead_alg(tfm), struct airoha_crypto_engine,
-			    alg.base);
+			    alg);
 }
 
 static int airoha_setkey(struct crypto_aead *tfm, const u8 *key,
@@ -93,7 +107,7 @@ static int airoha_init_tfm(struct crypto_aead *tfm)
 	if (stopping)
 		return -ENODEV;
 	ctx->engine = e;
-	crypto_aead_set_reqsize(tfm, sizeof(struct airoha_crypto_reqctx));
+	crypto_aead_set_reqsize(tfm, 0);
 	return 0;
 }
 
@@ -106,12 +120,31 @@ static void airoha_exit_tfm(struct crypto_aead *tfm)
 		complete(&ctx->engine->released);
 }
 
+static int airoha_reserve_slot(struct airoha_crypto_engine *e)
+{
+	int old, new, slot;
+	unsigned int mask = (1U << AIROHA_CRYPTO_NPU_BATCH_SIZE) - 1;
+
+	for (;;) {
+		old = atomic_read(&e->slots_in_use);
+		if ((unsigned int)old == mask)
+			return -EBUSY;
+		for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
+			if (!(old & BIT(slot)))
+				break;
+		new = old | BIT(slot);
+		if (atomic_cmpxchg(&e->slots_in_use, old, new) == old)
+			return slot;
+	}
+}
+
 static int airoha_enqueue(struct aead_request *req, bool decrypt)
 {
 	struct airoha_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
-	struct airoha_crypto_reqctx *rctx = aead_request_ctx(req);
+	struct airoha_crypto_work *job;
 	u32 data_len = req->cryptlen;
-	int ret;
+	unsigned long flags;
+	int slot;
 
 	if (!READ_ONCE(npu_enable))
 		return -EAGAIN;
@@ -120,17 +153,47 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 	if ((!decrypt || req->cryptlen >= AIROHA_CRYPTO_TAG_SIZE) &&
 	    data_len <= AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE)
 		return -EAGAIN;
-	if (atomic_cmpxchg(&ctx->engine->in_flight, 0, 1)) {
+	job = kzalloc(sizeof(*job), GFP_ATOMIC);
+	if (!job)
+		return -ENOMEM;
+	spin_lock_irqsave(&ctx->engine->lock, flags);
+	if (ctx->engine->stopping) {
+		spin_unlock_irqrestore(&ctx->engine->lock, flags);
+		kfree(job);
+		return -EAGAIN;
+	}
+	if (list_empty(&ctx->engine->pending))
+		slot = airoha_reserve_slot(ctx->engine);
+	else
+		slot = -EBUSY;
+	if (slot < 0) {
+		if (!READ_ONCE(npu_fallback)) {
+			job->req = req;
+			job->decrypt = decrypt;
+			INIT_WORK(&job->work, airoha_do_work);
+			list_add_tail(&job->pending, &ctx->engine->pending);
+			spin_unlock_irqrestore(&ctx->engine->lock, flags);
+			atomic64_inc(&npu_submitted);
+			return -EINPROGRESS;
+		}
+		spin_unlock_irqrestore(&ctx->engine->lock, flags);
+		kfree(job);
 		atomic64_inc(&npu_busy);
 		return -EAGAIN;
 	}
-	rctx->decrypt = decrypt;
-	ret = crypto_transfer_aead_request_to_engine(ctx->engine->engine, req);
-	if (ret == -EINPROGRESS || ret == -EBUSY)
-		atomic64_inc(&npu_submitted);
-	else
-		atomic_set_release(&ctx->engine->in_flight, 0);
-	return ret;
+	job->req = req;
+	job->slot = slot;
+	job->decrypt = decrypt;
+	INIT_WORK(&job->work, airoha_do_work);
+	if (unlikely(!queue_work(ctx->engine->workqueue, &job->work))) {
+		atomic_andnot(BIT(slot), &ctx->engine->slots_in_use);
+		spin_unlock_irqrestore(&ctx->engine->lock, flags);
+		kfree(job);
+		return -EIO;
+	}
+	spin_unlock_irqrestore(&ctx->engine->lock, flags);
+	atomic64_inc(&npu_submitted);
+	return -EINPROGRESS;
 }
 
 static int airoha_encrypt(struct aead_request *req)
@@ -143,17 +206,19 @@ static int airoha_decrypt(struct aead_request *req)
 	return airoha_enqueue(req, true);
 }
 
-static int airoha_do_one(struct crypto_engine *engine, void *request)
+static void airoha_do_work(struct work_struct *work)
 {
-	struct aead_request *req = container_of(request, struct aead_request, base);
+	struct airoha_crypto_work *job = container_of(work,
+								struct airoha_crypto_work,
+								work);
+	struct aead_request *req = job->req;
 	struct airoha_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
-	struct airoha_crypto_reqctx *rctx = aead_request_ctx(req);
 	struct airoha_crypto_request *buffer;
 	u32 data_len = req->cryptlen;
 	size_t capacity;
 	int len, status, err;
 
-	if (rctx->decrypt) {
+	if (job->decrypt) {
 		if (data_len < AIROHA_CRYPTO_TAG_SIZE) {
 			err = -EINVAL;
 			goto done;
@@ -173,13 +238,13 @@ static int airoha_do_one(struct crypto_engine *engine, void *request)
 	}
 	len = airoha_crypto_pack(buffer, capacity, req->src,
 				req->assoclen, req->cryptlen, ctx->key,
-				req->iv, rctx->decrypt);
+				req->iv, job->decrypt);
 	if (len < 0) {
 		err = len;
 		goto free;
 	}
 	status = ctx->engine->transport.transfer(ctx->engine->transport.ctx,
-						 buffer, len);
+						 job->slot, buffer, len);
 	if (status < 0) {
 		err = status;
 		goto free;
@@ -188,11 +253,24 @@ static int airoha_do_one(struct crypto_engine *engine, void *request)
 free:
 	kfree_sensitive(buffer);
 done:
-	atomic_set_release(&ctx->engine->in_flight, 0);
-	local_bh_disable();
-	crypto_finalize_aead_request(engine, req, err);
-	local_bh_enable();
-	return 0;
+	{
+		struct airoha_crypto_work *next = NULL;
+		unsigned long flags;
+
+		spin_lock_irqsave(&ctx->engine->lock, flags);
+		if (!list_empty(&ctx->engine->pending)) {
+			next = list_first_entry(&ctx->engine->pending,
+						struct airoha_crypto_work, pending);
+			list_del_init(&next->pending);
+			next->slot = job->slot;
+			WARN_ON_ONCE(!queue_work(ctx->engine->workqueue, &next->work));
+		} else {
+			atomic_andnot(BIT(job->slot), &ctx->engine->slots_in_use);
+		}
+		spin_unlock_irqrestore(&ctx->engine->lock, flags);
+	}
+	aead_request_complete(req, err);
+	kfree_rcu(job, rcu);
 }
 
 struct airoha_crypto_engine *
@@ -204,6 +282,7 @@ airoha_crypto_engine_register(struct device *dev,
 
 	if (!transport || !transport->transfer)
 		return ERR_PTR(-EINVAL);
+	(void)dev;
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e)
 		return ERR_PTR(-ENOMEM);
@@ -211,41 +290,38 @@ airoha_crypto_engine_register(struct device *dev,
 	refcount_set(&e->references, 1);
 	init_completion(&e->released);
 	spin_lock_init(&e->lock);
-	atomic_set(&e->in_flight, 0);
-	e->alg.base.setkey = airoha_setkey;
-	e->alg.base.setauthsize = airoha_setauthsize;
-	e->alg.base.encrypt = airoha_encrypt;
-	e->alg.base.decrypt = airoha_decrypt;
-	e->alg.base.init = airoha_init_tfm;
-	e->alg.base.exit = airoha_exit_tfm;
-	e->alg.base.ivsize = 12;
-	e->alg.base.maxauthsize = AIROHA_CRYPTO_TAG_SIZE;
-	strscpy(e->alg.base.base.cra_name, "airoha-npu-chacha20poly1305",
-		sizeof(e->alg.base.base.cra_name));
-	strscpy(e->alg.base.base.cra_driver_name, "airoha-npu-chacha20poly1305",
-		sizeof(e->alg.base.base.cra_driver_name));
-	e->alg.base.base.cra_priority = 100;
-	e->alg.base.base.cra_flags = CRYPTO_ALG_ASYNC;
-	e->alg.base.base.cra_blocksize = 1;
-	e->alg.base.base.cra_ctxsize = sizeof(struct airoha_crypto_ctx);
-	e->alg.base.base.cra_module = THIS_MODULE;
-	e->alg.op.do_one_request = airoha_do_one;
-	e->engine = crypto_engine_alloc_init(dev, false);
-	if (!e->engine) {
+	atomic_set(&e->slots_in_use, 0);
+	INIT_LIST_HEAD(&e->pending);
+	e->alg.setkey = airoha_setkey;
+	e->alg.setauthsize = airoha_setauthsize;
+	e->alg.encrypt = airoha_encrypt;
+	e->alg.decrypt = airoha_decrypt;
+	e->alg.init = airoha_init_tfm;
+	e->alg.exit = airoha_exit_tfm;
+	e->alg.ivsize = 12;
+	e->alg.maxauthsize = AIROHA_CRYPTO_TAG_SIZE;
+	strscpy(e->alg.base.cra_name, "airoha-npu-chacha20poly1305",
+		sizeof(e->alg.base.cra_name));
+	strscpy(e->alg.base.cra_driver_name, "airoha-npu-chacha20poly1305",
+		sizeof(e->alg.base.cra_driver_name));
+	e->alg.base.cra_priority = 100;
+	e->alg.base.cra_flags = CRYPTO_ALG_ASYNC;
+	e->alg.base.cra_blocksize = 1;
+	e->alg.base.cra_ctxsize = sizeof(struct airoha_crypto_ctx);
+	e->alg.base.cra_module = THIS_MODULE;
+	e->workqueue = alloc_workqueue("airoha-npu-crypto",
+				       WQ_UNBOUND | WQ_MEM_RECLAIM,
+				       AIROHA_CRYPTO_NPU_BATCH_SIZE);
+	if (!e->workqueue) {
 		ret = -ENOMEM;
 		goto free;
 	}
-	ret = crypto_engine_start(e->engine);
+	ret = crypto_register_aead(&e->alg);
 	if (ret)
-		goto exit_engine;
-	ret = crypto_engine_register_aead(&e->alg);
-	if (ret)
-		goto stop;
+		goto destroy_workqueue;
 	return e;
-stop:
-	crypto_engine_stop(e->engine);
-exit_engine:
-	crypto_engine_exit(e->engine);
+destroy_workqueue:
+	destroy_workqueue(e->workqueue);
 free:
 	kfree(e);
 	return ERR_PTR(ret);
@@ -260,10 +336,9 @@ void airoha_crypto_engine_unregister(struct airoha_crypto_engine *e)
 	if (refcount_dec_and_test(&e->references))
 		complete(&e->released);
 	spin_unlock_irqrestore(&e->lock, flags);
+	crypto_unregister_aead(&e->alg);
+	destroy_workqueue(e->workqueue);
 	wait_for_completion(&e->released);
-	crypto_engine_unregister_aead(&e->alg);
-	crypto_engine_stop(e->engine);
-	crypto_engine_exit(e->engine);
 	kfree(e);
 }
 

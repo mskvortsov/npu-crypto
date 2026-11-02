@@ -16,16 +16,16 @@ $(BUILD):
 	mkdir -p $@
 $(BUILD)/start.o: crypto_standalone/start.S | $(BUILD)
 	$(CC) $(ARCH) -c -o $@ $<
-$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_regs.h | $(BUILD)
+$(BUILD)/service.o: crypto_standalone/service.c npu_crypto.h npu_crypto_config.h npu_regs.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
-$(BUILD)/crypto.o: npu_crypto.c npu_crypto.h npu_types.h | $(BUILD)
+$(BUILD)/crypto.o: npu_crypto.c npu_crypto.h npu_crypto_config.h npu_types.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(BUILD)/chacha.S: crypto_standalone/cryptogams/chacha-riscv.pl | $(BUILD)
 	perl $< generic > $@
 $(BUILD)/chacha.o: $(BUILD)/chacha.S
 	$(CC) $(ARCH) -c -o $@ $<
 $(BUILD)/firmware.elf: $(OBJS) link.ld
-	$(LD) -m elf32lriscv -T link.ld --defsym=__ndbg_base=0x3e906800 \
+	$(LD) -m elf32lriscv -T link.ld --defsym=__ndbg_base=0x3e90f000 \
 		--gc-sections -Map=$(BUILD)/firmware.map -o $@ $(OBJS) $(LIBGCC)
 $(BUILD)/npu_rv32.bin: $(BUILD)/firmware.elf
 	$(OBJCOPY) -O binary -j .text -j .rodata $< $@

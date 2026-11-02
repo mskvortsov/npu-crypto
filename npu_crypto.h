@@ -2,6 +2,7 @@
 #define NPU_CRYPTO_H
 
 #include "npu_types.h"
+#include "npu_crypto_config.h"
 
 /* RFC 8439; src and dst must be identical or non-overlapping. */
 int npu_chacha20poly1305(u8 *dst, const u8 *src, u32 len,

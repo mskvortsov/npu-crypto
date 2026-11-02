@@ -9,7 +9,8 @@ struct airoha_crypto_engine;
 
 /* transfer must return only after releasing all access to request. */
 struct airoha_crypto_transport {
-	int (*transfer)(void *ctx, void *request, size_t length);
+	int (*transfer)(void *ctx, unsigned int slot, void *request,
+			size_t length);
 	void *ctx;
 };
 

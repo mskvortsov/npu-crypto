@@ -3,6 +3,7 @@
 #define _AIROHA_NPU_CRYPTO_PROTO_H
 
 #include <linux/types.h>
+#include "../npu_crypto_config.h"
 
 struct scatterlist;
 
