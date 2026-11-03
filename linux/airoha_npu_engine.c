@@ -14,6 +14,7 @@
 #include "airoha_npu_engine.h"
 
 #define AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE 1024
+#define AIROHA_CRYPTO_MAX_PENDING 128
 
 struct airoha_crypto_engine {
 	struct aead_alg alg;
@@ -24,6 +25,7 @@ struct airoha_crypto_engine {
 	spinlock_t lock;
 	atomic_t slots_in_use;
 	struct list_head pending;
+	unsigned int pending_count;
 	bool stopping;
 };
 
@@ -167,11 +169,13 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 	else
 		slot = -EBUSY;
 	if (slot < 0) {
-		if (!READ_ONCE(npu_fallback)) {
+		if (!READ_ONCE(npu_fallback) &&
+		    ctx->engine->pending_count < AIROHA_CRYPTO_MAX_PENDING) {
 			job->req = req;
 			job->decrypt = decrypt;
 			INIT_WORK(&job->work, airoha_do_work);
 			list_add_tail(&job->pending, &ctx->engine->pending);
+			ctx->engine->pending_count++;
 			spin_unlock_irqrestore(&ctx->engine->lock, flags);
 			atomic64_inc(&npu_submitted);
 			return -EINPROGRESS;
@@ -262,6 +266,7 @@ done:
 			next = list_first_entry(&ctx->engine->pending,
 						struct airoha_crypto_work, pending);
 			list_del_init(&next->pending);
+			ctx->engine->pending_count--;
 			next->slot = job->slot;
 			WARN_ON_ONCE(!queue_work(ctx->engine->workqueue, &next->work));
 		} else {

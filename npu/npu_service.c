@@ -4,16 +4,11 @@
 #include "npu_crypto.h"
 #include "npu_crypto_profile.h"
 
-#define SCRATCH_SIZE (NPU_CRYPTO_MAX_DATA + sizeof(struct npu_crypto_request_aad))
 #define GROUPS AIROHA_CRYPTO_NPU_BATCH_SIZE
 #define HARTS_PER_PACKET AIROHA_CRYPTO_NPU_HARTS_PER_PACKET
 #define ACTIVE_HARTS 8
 #define WORKERS_START 0x43525731
 #define CRYPTO_READY 0x43525931
-#ifndef NPU_POLY1305_SRAM
-#define NPU_POLY1305_SRAM 0
-#endif
-#define POLY_SCRATCH_BYTES 512
 
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
 static void parallel_xor(u8 *d, const u8 *s, u32 len, const u8 k[32], const u8 iv[12])
@@ -57,9 +52,6 @@ static volatile u32 leader_ready[GROUPS];
 /* The hardware mutex register address aliases hart pairs 0/4 through 3/7.
  * Serialize each pair before either attempts the shared hardware mutex. */
 static volatile u32 notify_pair_want[4][2], notify_pair_turn[4];
-#if NPU_POLY1305_SRAM
-static u32 poly_scratch[ACTIVE_HARTS][POLY_SCRATCH_BYTES / sizeof(u32)];
-#endif
 #if defined(NPU_CRYPTO_QEMU) && !defined(NPU_CRYPTO_QEMU_MAILBOX)
 volatile u32 npu_crypto_qemu_go;
 u32 npu_crypto_qemu_ready(void)
@@ -101,20 +93,8 @@ static void run_job(u32 g, u32 local)
 	else {
 		first = poly_boundary(j->blocks, local);
 		end = poly_boundary(j->blocks, local + 1);
-#if NPU_POLY1305_SRAM
-		{
-			u32 *scratch = poly_scratch[g * HARTS_PER_PACKET + local];
-			u32 i;
-			npu_poly1305_segment_buffered(group[g].parts[local], j->key,
-				j->aad, j->aad_length, j->src, j->length, first, end,
-				scratch, POLY_SCRATCH_BYTES);
-			for (i = 0; i < POLY_SCRATCH_BYTES / sizeof(u32); i++)
-				((volatile u32 *)scratch)[i] = 0;
-		}
-#else
 		npu_poly1305_segment(group[g].parts[local], j->key, j->aad,
 				     j->aad_length, j->src, j->length, first, end);
-#endif
 		/* The combiner starts with portion zero and never uses r^len[0]. */
 		if (local)
 			npu_poly1305_power(group[g].powers[local], j->key, end - first);
@@ -249,7 +229,7 @@ static npu_crypto_poly_fn poly_fn[GROUPS] = { poly_0,
 /* The host retains each DMA slot until completion and clears it afterwards. */
 static int process_request(u32 g, void *buffer, u32 length)
 {
- if (length < sizeof(struct npu_crypto_request) || length > SCRATCH_SIZE)
+ if (length < sizeof(struct npu_crypto_request) || length > AIROHA_CRYPTO_MAX_REQUEST)
   return 0;
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
  (void)g;
@@ -344,9 +324,10 @@ static void __attribute__((noreturn)) service_group(u32 g)
 			for (i = 0; i < sizeof(group[g].sample) / 4; i++) p[i] = 0;
 			t = csr_read(mcycle);
 		}
-		if ((arg & 0x7821) == 1)
+		if ((arg & 0x7821) == 1 &&
+		    (!group[g].profiling || (REG32(MBQ_CTRL1(queue)) & 0xffff) <= AIROHA_PROFILE_OFFSET))
 			ret = crypto_request(g, base, REG32(MBQ_CTRL1(queue)) & 0xffff);
-		if (group[g].profiling) {
+		if (group[g].profiling && (REG32(MBQ_CTRL1(queue)) & 0xffff) <= AIROHA_PROFILE_OFFSET) {
 			volatile u32 *dst;
 			u32 *src = (u32 *)&group[g].sample;
 			group[g].sample.total = (u32)csr_read(mcycle) - t;

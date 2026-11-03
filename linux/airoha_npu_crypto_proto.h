@@ -9,7 +9,6 @@ struct scatterlist;
 
 #define AIROHA_CRYPTO_VERSION 2
 #define AIROHA_CRYPTO_MAX_DATA 16384
-#define AIROHA_CRYPTO_MAX_REQUEST 65535
 #define AIROHA_CRYPTO_TAG_SIZE 16
 
 struct airoha_crypto_request {

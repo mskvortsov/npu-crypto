@@ -58,10 +58,10 @@ version, operation, data length and associated-data length are four
 little-endian words at offsets 0, 4, 8 and 12; nonce, key and tag are at
 16, 28 and 60. The associated data immediately follows the header and the
 in-place data follows that. The mailbox length covers all three. Version 1
-remains accepted. The dedicated service limits the whole request to 16460
-bytes, including its header. For version 2, associated data plus payload must
-therefore fit within 16384 bytes; the payload alone is also limited to 16384
-bytes. The mailbox length field is 16 bits.
+remains accepted. The whole request is limited to 65535 bytes, including its
+header, and the payload is limited to 16384 bytes. Profiling reserves the final
+256 bytes of the slot, limiting the request to 65280 bytes. The mailbox length
+field is 16 bits.
 
 `python3 tests/test_crypto_request.py` exercises both associated-data and
 payload boundaries through the version 2 request processor. It does not test
@@ -122,7 +122,11 @@ ChaCha20-Poly1305 path, which may use NEON. Set
 `/sys/module/airoha_npu_crypto/parameters/npu_enable` to `0` to send all
 requests through that software path, or `1` to enable the size threshold again.
 If the NPU is already busy, `npu_fallback` selects software fallback when set
-or queues the request for a free slot when cleared. When `npu_enable` is `0`,
+or queues the request for a free slot when cleared. Up to 128 requests may
+wait for a slot; once that queue is full, the engine returns `-EAGAIN` without
+retaining the request or invoking its callback. Accepted requests return
+`-EINPROGRESS` and receive one completion callback, including during teardown.
+When `npu_enable` is `0`,
 `npu_fallback` has no effect. Both parameters default to `1`.
 The read-only parameters `npu_submitted` and
 `npu_busy` count accepted and busy-rejected requests respectively since the

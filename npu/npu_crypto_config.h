@@ -2,6 +2,8 @@
 #ifndef AIROHA_NPU_CRYPTO_CONFIG_H
 #define AIROHA_NPU_CRYPTO_CONFIG_H
 
+#define AIROHA_CRYPTO_MAX_REQUEST 65535
+
 /* Eight compute harts are split evenly across this many packet workers. */
 #ifndef AIROHA_CRYPTO_NPU_BATCH_SIZE
 #define AIROHA_CRYPTO_NPU_BATCH_SIZE 4

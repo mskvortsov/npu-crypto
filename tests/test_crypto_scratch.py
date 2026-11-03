@@ -37,4 +37,12 @@ with tempfile.TemporaryDirectory() as tmp:
         before = padded.raw
         assert request(padded, len(raw)) == 2
         assert padded.raw == before
-print('In-place crypto requests: 13 cases passed')
+    for size, aad_size in ((16384, 1), (1500, 14885), (16384, 49075)):
+        key, nonce = os.urandom(32), os.urandom(12)
+        data, aad = os.urandom(size), os.urandom(aad_size)
+        raw = struct.pack('<IIII', 2, 0, size, aad_size) + nonce + key + bytes(16) + aad + data
+        buf = ctypes.create_string_buffer(raw)
+        assert request(buf, len(raw)) == 1
+        assert buf.raw[76 + aad_size:76 + aad_size + size] + buf.raw[60:76] == ChaCha20Poly1305(key).encrypt(nonce, data, aad)
+    assert request(buf, 65536) == 0
+print('In-place crypto requests: 16 cases passed')

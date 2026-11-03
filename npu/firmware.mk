@@ -8,20 +8,15 @@ CFLAGS := $(ARCH) -Os -ffreestanding -fno-builtin -ffunction-sections \
 	-fdata-sections -Wall -Wextra -DAN7581 -DNOWIFI -Inpu
 LIBGCC := $(shell $(CC) $(ARCH) -print-libgcc-file-name)
 OBJS := $(BUILD)/start.o $(BUILD)/service.o $(BUILD)/crypto.o $(BUILD)/chacha.o $(BUILD)/poly1305.o
-NPU_POLY1305_SRAM ?= 0
-CFLAGS += -DNPU_POLY1305_SRAM=$(NPU_POLY1305_SRAM)
 
 .PHONY: all
 all: $(BUILD)/npu_rv32.bin $(BUILD)/npu_data.bin
 
 $(BUILD):
 	mkdir -p $@
-$(BUILD)/poly-sram-config-$(NPU_POLY1305_SRAM): | $(BUILD)
-	rm -f $(BUILD)/poly-sram-config-*
-	touch $@
 $(BUILD)/start.o: npu/npu_start.S | $(BUILD)
 	$(CC) $(ARCH) -c -o $@ $<
-$(BUILD)/service.o: npu/npu_service.c npu/npu_crypto.h npu/npu_crypto_config.h npu/npu_crypto_profile.h npu/npu_regs.h $(BUILD)/poly-sram-config-$(NPU_POLY1305_SRAM) | $(BUILD)
+$(BUILD)/service.o: npu/npu_service.c npu/npu_crypto.h npu/npu_crypto_config.h npu/npu_crypto_profile.h npu/npu_regs.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 $(BUILD)/crypto.o: npu/npu_crypto.c npu/npu_crypto.h npu/npu_crypto_config.h npu/npu_types.h | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<

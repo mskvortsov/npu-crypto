@@ -7,6 +7,7 @@
 #include <linux/iopoll.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
@@ -41,6 +42,10 @@
 #define NPU_STATUS_MASK 7
 #define NPU_TIMEOUT_US 1000000
 #define NPU_DMA_SLOT_SIZE ((AIROHA_CRYPTO_MAX_REQUEST + 3) & ~3)
+
+/* There is no known safe way to stop the harts once boot is attempted. */
+static DEFINE_MUTEX(airoha_boot_lock);
+static bool airoha_boot_attempted;
 
 static bool npu_profile;
 module_param(npu_profile, bool, 0644);
@@ -319,6 +324,20 @@ static int airoha_crypto_boot(struct platform_device *pdev,
 		release_firmware(fw);
 		return -EINVAL;
 	}
+	mutex_lock(&airoha_boot_lock);
+	if (airoha_boot_attempted) {
+		mutex_unlock(&airoha_boot_lock);
+		release_firmware(fw);
+		return dev_err_probe(dev, -EBUSY, "NPU firmware already started; reboot required\n");
+	}
+	/* Keep this guard alive across failed probes and module removal. */
+	if (!try_module_get(THIS_MODULE)) {
+		mutex_unlock(&airoha_boot_lock);
+		release_firmware(fw);
+		return -ENODEV;
+	}
+	airoha_boot_attempted = true;
+	mutex_unlock(&airoha_boot_lock);
 	memcpy_toio(code, fw->data, fw->size);
 	release_firmware(fw);
 	writel(0, npu->regs + NPU_MIB30);
