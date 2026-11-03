@@ -1,92 +1,218 @@
-diff --git a/drivers/net/wireguard/npu_crypto.h b/drivers/net/wireguard/npu_crypto.h
-new file mode 100644
-index 0000000..8fbfff8
---- /dev/null
-+++ b/drivers/net/wireguard/npu_crypto.h
-@@ -0,0 +1,47 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#ifndef WG_NPU_CRYPTO_H
-+#define WG_NPU_CRYPTO_H
-+
+diff --git a/drivers/net/wireguard/Makefile b/drivers/net/wireguard/Makefile
+--- a/drivers/net/wireguard/Makefile
++++ b/drivers/net/wireguard/Makefile
+@@ -8,6 +8,7 @@
+ wireguard-y += queueing.o
+ wireguard-y += send.o
+ wireguard-y += receive.o
++wireguard-y += npu_crypto.o
+ wireguard-y += socket.o
+ wireguard-y += peerlookup.o
+ wireguard-y += allowedips.o
+diff --git a/drivers/net/wireguard/noise.c b/drivers/net/wireguard/noise.c
+--- a/drivers/net/wireguard/noise.c
++++ b/drivers/net/wireguard/noise.c
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include "noise.h"
++#include "npu_crypto.h"
 +#include <crypto/aead.h>
-+#include <linux/crypto.h>
-+#include <linux/unaligned.h>
+ #include "device.h"
+ #include "peer.h"
+ #include "messages.h"
+@@ -99,6 +101,8 @@
+ {
+ 	struct noise_keypair *keypair = kzalloc(sizeof(*keypair), GFP_KERNEL);
+ 
++	BUILD_BUG_ON(offsetof(struct noise_keypair, entry) != 0);
 +
-+/* Called by the per-device crypt workers, which can sleep. */
-+static int wg_npu_crypt(struct scatterlist *sg, size_t len, u64 counter,
-+			const u8 key[32], bool decrypt)
-+{
-+	DECLARE_CRYPTO_WAIT(wait);
-+	struct crypto_aead *tfm;
-+	struct aead_request *req;
-+	u8 iv[12] = { 0 };
-+	int ret;
+ 	if (unlikely(!keypair))
+ 		return NULL;
+ 	spin_lock_init(&keypair->receiving_counter.lock);
+@@ -125,6 +129,8 @@
+ 			    keypair->entry.peer->internal_id);
+ 	wg_index_hashtable_remove(keypair->entry.peer->device->index_hashtable,
+ 				  &keypair->entry);
++	crypto_free_aead(keypair->npu_sending);
++	crypto_free_aead(keypair->npu_receiving);
+ 	call_rcu(&keypair->rcu, keypair_free_rcu);
+ }
+ 
+@@ -838,6 +844,8 @@
+ 		derive_keys(&new_keypair->receiving, &new_keypair->sending,
+ 			    handshake->chaining_key);
+ 
++	new_keypair->npu_sending = wg_npu_alloc(new_keypair->sending.key);
++	new_keypair->npu_receiving = wg_npu_alloc(new_keypair->receiving.key);
+ 	handshake_zero(handshake);
+ 	rcu_read_lock_bh();
+ 	if (likely(!READ_ONCE(container_of(handshake, struct wg_peer,
+@@ -851,6 +859,8 @@
+ 			handshake->entry.peer->device->index_hashtable,
+ 			&handshake->entry, &new_keypair->entry);
+ 	} else {
++		crypto_free_aead(new_keypair->npu_sending);
++		crypto_free_aead(new_keypair->npu_receiving);
+ 		kfree_sensitive(new_keypair);
+ 	}
+ 	rcu_read_unlock_bh();
+diff --git a/drivers/net/wireguard/noise.h b/drivers/net/wireguard/noise.h
+--- a/drivers/net/wireguard/noise.h
++++ b/drivers/net/wireguard/noise.h
+@@ -27,8 +27,12 @@
+ 	bool is_valid;
+ };
+ 
++struct crypto_aead;
 +
-+	tfm = crypto_alloc_aead("airoha-npu-chacha20poly1305", 0, 0);
-+	if (IS_ERR(tfm))
-+		return -EOPNOTSUPP;
-+	ret = crypto_aead_setkey(tfm, key, 32);
-+	if (ret)
-+		goto free_tfm;
-+	ret = crypto_aead_setauthsize(tfm, 16);
-+	if (ret)
-+		goto free_tfm;
-+	req = aead_request_alloc(tfm, GFP_KERNEL);
-+	if (!req) {
-+		ret = -ENOMEM;
-+		goto free_tfm;
-+	}
-+	put_unaligned_le64(counter, iv + 4);
-+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP |
-+				  CRYPTO_TFM_REQ_MAY_BACKLOG,
-+				  crypto_req_done, &wait);
-+	aead_request_set_ad(req, 0);
-+	aead_request_set_crypt(req, sg, sg, len, iv);
-+	ret = crypto_wait_req(decrypt ? crypto_aead_decrypt(req) :
-+				       crypto_aead_encrypt(req), &wait);
-+	aead_request_free(req);
-+free_tfm:
-+	crypto_free_aead(tfm);
-+	return ret;
-+}
-+
-+#endif
+ struct noise_keypair {
++	/* Receive lookup casts an index entry directly to a keypair. */
+ 	struct index_hashtable_entry entry;
++	struct crypto_aead *npu_sending, *npu_receiving;
+ 	struct noise_symmetric_key sending;
+ 	atomic64_t sending_counter;
+ 	struct noise_symmetric_key receiving;
+diff --git a/drivers/net/wireguard/peer.c b/drivers/net/wireguard/peer.c
+--- a/drivers/net/wireguard/peer.c
++++ b/drivers/net/wireguard/peer.c
+@@ -36,6 +36,8 @@
+ 	if (unlikely(dst_cache_init(&peer->endpoint_cache, GFP_KERNEL)))
+ 		goto err;
+ 
++	atomic_set(&peer->npu_inflight, 0);
++	init_waitqueue_head(&peer->npu_wait);
+ 	peer->device = wg;
+ 	wg_noise_handshake_init(&peer->handshake, &wg->static_identity,
+ 				public_key, preshared_key, peer);
+@@ -114,6 +116,12 @@
+ 
+ 	/* a) For encrypt/decrypt. */
+ 	flush_workqueue(peer->device->packet_crypt_wq);
++	/* Crypto workers can hand ownership to the asynchronous NPU. Drain
++	 * callbacks before flushing TX ingestion or disabling receive NAPI.
++	 */
++	wait_event(peer->npu_wait, !atomic_read(&peer->npu_inflight));
++	/* Include the callbacks' final peer reference releases in the drain. */
++	synchronize_rcu();
+ 	/* b.1) For send (but not receive, since that's napi). */
+ 	flush_workqueue(peer->device->packet_crypt_wq);
+ 	/* b.2.1) For receive (but not send, since that's wq). */
+diff --git a/drivers/net/wireguard/peer.h b/drivers/net/wireguard/peer.h
+--- a/drivers/net/wireguard/peer.h
++++ b/drivers/net/wireguard/peer.h
+@@ -11,6 +11,7 @@
+ #include "cookie.h"
+ 
+ #include <linux/types.h>
++#include <linux/wait.h>
+ #include <linux/netfilter.h>
+ #include <linux/spinlock.h>
+ #include <linux/kref.h>
+@@ -35,6 +36,8 @@
+ };
+ 
+ struct wg_peer {
++	atomic_t npu_inflight;
++	wait_queue_head_t npu_wait;
+ 	struct wg_device *device;
+ 	struct prev_queue tx_queue, rx_queue;
+ 	struct sk_buff_head staged_packet_queue;
 diff --git a/drivers/net/wireguard/receive.c b/drivers/net/wireguard/receive.c
-index eb88511..5226a3c 100644
 --- a/drivers/net/wireguard/receive.c
 +++ b/drivers/net/wireguard/receive.c
-@@ -10,6 +10,7 @@
+@@ -9,6 +9,7 @@
+ #include "timers.h"
  #include "messages.h"
  #include "cookie.h"
- #include "socket.h"
 +#include "npu_crypto.h"
+ #include "socket.h"
  
  #include <linux/ip.h>
- #include <linux/ipv6.h>
-@@ -244,7 +245,7 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+@@ -239,12 +240,32 @@
+ 	}
+ }
+ 
+-static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
++static bool decrypt_finish(struct sk_buff *skb)
++{
++	unsigned int offset = -skb_network_offset(skb);
++	bool ok;
++	skb_push(skb, offset);
++	ok = !pskb_trim(skb, skb->len - noise_encrypted_len(0));
++	skb_pull(skb, offset);
++	return ok;
++}
++
++static void decrypt_done(void *data, bool ok)
++{
++	struct sk_buff *skb = data;
++
++	if (ok)
++		ok = decrypt_finish(skb);
++	wg_queue_enqueue_per_peer_rx(skb, ok ? PACKET_STATE_CRYPTED :
++					       PACKET_STATE_DEAD);
++}
++
++static int decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+ {
  	struct scatterlist sg[MAX_SKB_FRAGS + 8];
  	struct sk_buff *trailer;
  	unsigned int offset;
 -	int num_frags;
-+	int num_frags, npu_ret;
++	int num_frags, ret;
  
  	if (unlikely(!keypair))
  		return false;
-@@ -275,7 +276,11 @@ static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+@@ -275,20 +296,21 @@
  	if (skb_to_sgvec(skb, sg, 0, skb->len) <= 0)
  		return false;
  
 -	if (!chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
-+	npu_ret = wg_npu_crypt(sg, skb->len, PACKET_CB(skb)->nonce,
-+			       keypair->receiving.key, true);
-+	if (npu_ret == -EBADMSG)
+-					         PACKET_CB(skb)->nonce,
+-						 keypair->receiving.key))
++	ret = wg_npu_submit(sg, num_frags, skb->len, keypair,
++			    PACKET_CB(skb)->nonce, true, decrypt_done, skb);
++	if (ret == -EINPROGRESS)
++		return ret;
++	if (ret == -EBADMSG || (ret && READ_ONCE(wg_npu_only)))
 +		return false;
-+	if (npu_ret && !chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
- 					         PACKET_CB(skb)->nonce,
- 						 keypair->receiving.key))
++	if (ret && !chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
++							PACKET_CB(skb)->nonce,
++							keypair->receiving.key))
  		return false;
+ 
+ 	/* Another ugly situation of pushing and pulling the header so as to
+ 	 * keep endpoint information intact.
+ 	 */
+-	skb_push(skb, offset);
+-	if (pskb_trim(skb, skb->len - noise_encrypted_len(0)))
+-		return false;
+-	skb_pull(skb, offset);
+-
+-	return true;
++	return decrypt_finish(skb);
+ }
+ 
+ /* This is RFC6479, a replay detection bitmap algorithm that avoids bitshifts */
+@@ -497,10 +519,12 @@
+ 	struct sk_buff *skb;
+ 
+ 	while ((skb = ptr_ring_consume_bh(&queue->ring)) != NULL) {
+-		enum packet_state state =
+-			likely(decrypt_packet(skb, PACKET_CB(skb)->keypair)) ?
+-				PACKET_STATE_CRYPTED : PACKET_STATE_DEAD;
+-		wg_queue_enqueue_per_peer_rx(skb, state);
++		int ret = decrypt_packet(skb, PACKET_CB(skb)->keypair);
++
++		if (ret != -EINPROGRESS)
++			wg_queue_enqueue_per_peer_rx(
++				skb,
++				ret ? PACKET_STATE_CRYPTED : PACKET_STATE_DEAD);
+ 		if (need_resched())
+ 			cond_resched();
+ 	}
 diff --git a/drivers/net/wireguard/send.c b/drivers/net/wireguard/send.c
-index 67d0147..769f9b0 100644
 --- a/drivers/net/wireguard/send.c
 +++ b/drivers/net/wireguard/send.c
 @@ -10,6 +10,7 @@
@@ -97,23 +223,278 @@ index 67d0147..769f9b0 100644
  
  #include <linux/uio.h>
  #include <linux/inetdevice.h>
-@@ -165,7 +166,7 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+@@ -159,13 +160,48 @@
+ 	return padded_size - last_unit;
+ }
+ 
+-static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
++struct encrypt_batch {
++	struct sk_buff *first;
++	refcount_t pending;
++	atomic_t failed;
++};
++struct encrypt_completion {
++	struct encrypt_batch *batch;
++	struct sk_buff *skb;
++};
++
++static void encrypt_batch_put(struct encrypt_batch *batch)
++{
++	if (refcount_dec_and_test(&batch->pending)) {
++		wg_queue_enqueue_per_peer_tx(batch->first,
++					     atomic_read(&batch->failed) ?
++						     PACKET_STATE_DEAD :
++						     PACKET_STATE_CRYPTED);
++		kfree(batch);
++	}
++}
++
++static void encrypt_done(void *data, bool ok)
++{
++	struct encrypt_completion *ctx = data;
++
++	if (ok)
++		wg_reset_packet(ctx->skb, true);
++	else
++		atomic_set(&ctx->batch->failed, 1);
++	encrypt_batch_put(ctx->batch);
++	kfree(ctx);
++}
++
++static int encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair,
++			  struct encrypt_batch *batch)
+ {
+ 	unsigned int padding_len, plaintext_len, trailer_len;
  	struct scatterlist sg[MAX_SKB_FRAGS + 8];
  	struct message_data *header;
  	struct sk_buff *trailer;
 -	int num_frags;
-+	int num_frags, npu_ret;
++	struct encrypt_completion *ctx;
++	int num_frags, ret;
  
  	/* Force hash calculation before encryption so that flow analysis is
  	 * consistent over the inner packet.
-@@ -213,6 +214,10 @@ static bool encrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+@@ -212,6 +248,25 @@
+ 	sg_init_table(sg, num_frags);
  	if (skb_to_sgvec(skb, sg, sizeof(struct message_data),
  			 noise_encrypted_len(plaintext_len)) <= 0)
++		return false;
++	if (batch) {
++		ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
++		if (ctx) {
++			ctx->batch = batch;
++			ctx->skb = skb;
++			refcount_inc(&batch->pending);
++			ret = wg_npu_submit(sg, num_frags, plaintext_len,
++					    keypair, PACKET_CB(skb)->nonce,
++					    false, encrypt_done, ctx);
++			if (ret == -EINPROGRESS)
++				return ret;
++			kfree(ctx);
++			encrypt_batch_put(batch);
++			if (!ret)
++				return true;
++		}
++	}
++	if (READ_ONCE(wg_npu_only))
  		return false;
-+	npu_ret = wg_npu_crypt(sg, plaintext_len, PACKET_CB(skb)->nonce,
-+			       keypair->sending.key, false);
-+	if (!npu_ret)
-+		return true;
  	return chacha20poly1305_encrypt_sg_inplace(sg, plaintext_len, NULL, 0,
  						   PACKET_CB(skb)->nonce,
- 						   keypair->sending.key);
+@@ -291,18 +346,33 @@
+ 	struct sk_buff *first, *skb, *next;
+ 
+ 	while ((first = ptr_ring_consume_bh(&queue->ring)) != NULL) {
++		struct encrypt_batch *batch =
++			kzalloc(sizeof(*batch), GFP_KERNEL);
+ 		enum packet_state state = PACKET_STATE_CRYPTED;
+-
+-		skb_list_walk_safe(first, skb, next) {
+-			if (likely(encrypt_packet(skb,
+-					PACKET_CB(first)->keypair))) {
++		if (batch) {
++			batch->first = first;
++			refcount_set(&batch->pending, 1);
++			atomic_set(&batch->failed, 0);
++		}
++		skb_list_walk_safe(first, skb, next)
++		{
++			int ret = encrypt_packet(skb, PACKET_CB(first)->keypair,
++						 batch);
++			if (ret == -EINPROGRESS)
++				continue;
++			if (ret) {
+ 				wg_reset_packet(skb, true);
+ 			} else {
+ 				state = PACKET_STATE_DEAD;
++				if (batch)
++					atomic_set(&batch->failed, 1);
+ 				break;
+ 			}
+ 		}
+-		wg_queue_enqueue_per_peer_tx(first, state);
++		if (batch)
++			encrypt_batch_put(batch);
++		else
++			wg_queue_enqueue_per_peer_tx(first, state);
+ 		if (need_resched())
+ 			cond_resched();
+ 	}
+diff --git a/drivers/net/wireguard/npu_crypto.c b/drivers/net/wireguard/npu_crypto.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireguard/npu_crypto.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <crypto/aead.h>
++#include <crypto/chacha20poly1305.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/rcupdate.h>
++#include <linux/unaligned.h>
++#include "npu_crypto.h"
++#include "peer.h"
++
++bool wg_npu_only;
++module_param_named(npu_only, wg_npu_only, bool, 0644);
++MODULE_PARM_DESC(npu_only, "Test mode: queue all data crypto on NPU; never use software (default: false)");
++
++struct wg_npu_request {
++	struct aead_request *req;
++	struct noise_keypair *keypair;
++	struct wg_peer *peer;
++	void (*done)(void *, bool);
++	void *data;
++	size_t len;
++	u64 counter;
++	bool decrypt, npu_only;
++	u8 iv[12];
++	struct scatterlist sg[];
++};
++
++struct crypto_aead *wg_npu_alloc(const u8 key[32])
++{
++	struct crypto_aead *tfm;
++	int ret;
++	tfm = crypto_alloc_aead("airoha-npu-chacha20poly1305", 0, 0);
++	if (IS_ERR(tfm))
++		return NULL;
++	ret = crypto_aead_setkey(tfm, key, 32);
++	if (!ret)
++		ret = crypto_aead_setauthsize(tfm, 16);
++	if (ret) {
++		crypto_free_aead(tfm);
++		return NULL;
++	}
++	return tfm;
++}
++
++/* The drain waits for zero and an RCU grace period. Keep the final peer
++ * reference release inside that period so device destruction cannot race it.
++ */
++static void wg_npu_put(struct wg_peer *peer)
++{
++	rcu_read_lock();
++	if (atomic_dec_and_test(&peer->npu_inflight))
++		wake_up_all(&peer->npu_wait);
++	wg_peer_put(peer);
++	rcu_read_unlock();
++}
++
++static void wg_npu_complete(void *data, int err)
++{
++	struct wg_npu_request *ctx = data;
++	struct wg_peer *peer = ctx->peer;
++	bool ok = !err;
++
++	if (err == -EINPROGRESS)
++		return;
++	/* Transport failures leave the packet untouched. Authentication failures
++	 * must never be retried as successful software decryptions.
++	 */
++	if (err && err != -EBADMSG && !ctx->npu_only) {
++		if (ctx->decrypt)
++			ok = chacha20poly1305_decrypt_sg_inplace(
++				ctx->sg, ctx->len, NULL, 0, ctx->counter,
++				ctx->keypair->receiving.key);
++		else
++			ok = chacha20poly1305_encrypt_sg_inplace(
++				ctx->sg, ctx->len, NULL, 0, ctx->counter,
++				ctx->keypair->sending.key);
++	}
++	aead_request_free(ctx->req);
++	ctx->done(ctx->data, ok);
++	kfree_sensitive(ctx);
++	/* done may publish the packet and release its peer/keypair references.
++	 * Keep our peer reference until teardown can observe completion.
++	 */
++	wg_npu_put(peer);
++}
++
++int wg_npu_submit(struct scatterlist *sg, unsigned int nents, size_t len,
++		  struct noise_keypair *keypair, u64 counter, bool decrypt,
++		  void (*done)(void *, bool), void *data)
++{
++	struct crypto_aead *tfm = decrypt ? keypair->npu_receiving :
++					    keypair->npu_sending;
++	struct wg_npu_request *ctx;
++	struct wg_peer *peer;
++	bool strict = READ_ONCE(wg_npu_only);
++	int ret;
++
++	if (!tfm || (!strict && len <= 1024 + (decrypt ? 16 : 0)))
++		return -EAGAIN;
++	ctx = kzalloc(struct_size(ctx, sg, nents), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->req = aead_request_alloc(tfm, GFP_KERNEL);
++	if (!ctx->req) {
++		kfree(ctx);
++		return -ENOMEM;
++	}
++	memcpy(ctx->sg, sg, sizeof(*sg) * nents);
++	ctx->keypair = keypair;
++	ctx->peer = peer = wg_peer_get(keypair->entry.peer);
++	ctx->done = done;
++	ctx->data = data;
++	ctx->len = len;
++	ctx->counter = counter;
++	ctx->decrypt = decrypt;
++	ctx->npu_only = strict;
++	put_unaligned_le64(counter, ctx->iv + 4);
++	/* Test mode requests bounded driver backlog, including small packets. */
++	aead_request_set_callback(ctx->req, CRYPTO_TFM_REQ_MAY_SLEEP |
++				  (strict ? CRYPTO_TFM_REQ_MAY_BACKLOG : 0),
++				  wg_npu_complete, ctx);
++	aead_request_set_ad(ctx->req, 0);
++	aead_request_set_crypt(ctx->req, ctx->sg, ctx->sg, len, ctx->iv);
++	atomic_inc(&peer->npu_inflight);
++	ret = decrypt ? crypto_aead_decrypt(ctx->req) :
++			crypto_aead_encrypt(ctx->req);
++	if (ret == -EINPROGRESS)
++		return ret; /* ctx may already have been freed by the callback. */
++	aead_request_free(ctx->req);
++	kfree_sensitive(ctx);
++	wg_npu_put(peer);
++	return ret;
++}
+diff --git a/drivers/net/wireguard/npu_crypto.h b/drivers/net/wireguard/npu_crypto.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/wireguard/npu_crypto.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef WG_NPU_CRYPTO_H
++#define WG_NPU_CRYPTO_H
++#include <linux/scatterlist.h>
++#include <linux/types.h>
++extern bool wg_npu_only;
++struct noise_keypair;
++struct crypto_aead;
++struct crypto_aead *wg_npu_alloc(const u8 key[32]);
++/* -EINPROGRESS transfers ownership to done, which may run before return.
++ * Other returns leave ownership with the caller; no callback is made.
++ */
++int wg_npu_submit(struct scatterlist *sg, unsigned int nents, size_t len,
++		  struct noise_keypair *keypair, u64 counter, bool decrypt,
++		  void (*done)(void *, bool), void *data);
++#endif

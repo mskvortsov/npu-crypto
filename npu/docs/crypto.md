@@ -115,19 +115,22 @@ Cryptogams license is in `npu/cryptogams/LICENSE` and is included in the
 OpenWrt package.
 
 By default, the Linux engine admits four NPU requests at a time. The writable
-`npu_enable` module parameter controls NPU use at runtime. When enabled, only
-requests with more than 1024 bytes of payload are submitted to the NPU; smaller
-requests return `-EAGAIN` so the WireGuard patch uses its software
-ChaCha20-Poly1305 path, which may use NEON. Set
-`/sys/module/airoha_npu_crypto/parameters/npu_enable` to `0` to send all
-requests through that software path, or `1` to enable the size threshold again.
-If the NPU is already busy, `npu_fallback` selects software fallback when set
-or queues the request for a free slot when cleared. Up to 128 requests may
-wait for a slot; once that queue is full, the engine returns `-EAGAIN` without
-retaining the request or invoking its callback. Accepted requests return
-`-EINPROGRESS` and receive one completion callback, including during teardown.
-When `npu_enable` is `0`,
-`npu_fallback` has no effect. Both parameters default to `1`.
+`npu_enable` module parameter (default `1`) controls NPU use at runtime.
+When disabled, requests return `-EAGAIN` without being retained.
+Requests without `CRYPTO_TFM_REQ_MAY_BACKLOG` use the NPU only above 1024 bytes
+of payload and return `-EAGAIN` if all slots are busy. Requests with that flag
+bypass the size threshold and queue when busy. Up to 128 requests may wait
+for a slot; queue overflow returns `-EAGAIN` without retaining the request or
+invoking its callback. Accepted requests return `-EINPROGRESS` and receive one
+completion callback, including during teardown.
+
+WireGuard's `npu_only` parameter (default `0`) controls its data-crypto policy.
+Normal mode uses software for small packets, busy hardware, and transport
+failures. Test mode requests backlog for all data packets and drops packets
+on submission or completion failure, with no software crypto fallback.
+Handshakes remain in software. Disabling `npu_enable` in test mode drops data
+packets. The former `npu_fallback` parameter has been removed; remove it from
+module options. Other crypto clients requesting backlog now queue automatically.
 The read-only parameters `npu_submitted` and
 `npu_busy` count accepted and busy-rejected requests respectively since the
 module was loaded; requests skipped because they are small or NPU use is

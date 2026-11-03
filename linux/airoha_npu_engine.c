@@ -32,16 +32,11 @@ struct airoha_crypto_engine {
 static atomic64_t npu_submitted = ATOMIC64_INIT(0);
 static atomic64_t npu_busy = ATOMIC64_INIT(0);
 static bool npu_enable = true;
-static bool npu_fallback = true;
 
 module_param(npu_enable, bool, 0644);
 MODULE_PARM_DESC(
 	npu_enable,
 	"Enable NPU offload above the minimum payload size (default: true)");
-module_param(npu_fallback, bool, 0644);
-MODULE_PARM_DESC(
-	npu_fallback,
-	"Use software/NEON fallback when all NPU packet slots are busy (default: true)");
 
 static int airoha_counter_get(char *buffer, const struct kernel_param *param)
 {
@@ -156,7 +151,8 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 	if (decrypt && data_len >= AIROHA_CRYPTO_TAG_SIZE)
 		data_len -= AIROHA_CRYPTO_TAG_SIZE;
 	if ((!decrypt || req->cryptlen >= AIROHA_CRYPTO_TAG_SIZE) &&
-	    data_len <= AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE)
+	    data_len <= AIROHA_CRYPTO_MIN_NPU_PAYLOAD_SIZE &&
+	    !(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 		return -EAGAIN;
 	job = kzalloc(sizeof(*job), GFP_ATOMIC);
 	if (!job)
@@ -172,7 +168,7 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 	else
 		slot = -EBUSY;
 	if (slot < 0) {
-		if (!READ_ONCE(npu_fallback) &&
+		if ((req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG) &&
 		    ctx->engine->pending_count < AIROHA_CRYPTO_MAX_PENDING) {
 			job->req = req;
 			job->decrypt = decrypt;
