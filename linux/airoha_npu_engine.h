@@ -8,12 +8,16 @@ struct device;
 struct airoha_crypto_engine;
 
 /* The engine owns a slot exclusively from buffer() through release().
- * transfer() returns after DMA completes, or quarantines the buffer on error.
+ * submit() starts DMA without waiting. result() returns -EINPROGRESS until
+ * completion, or quarantines the buffer on timeout. Calls are serialized by
+ * the engine workqueue. stop() disables and synchronizes completion interrupts.
  * release() clears the used bytes unless the transport is quarantined.
  */
 struct airoha_crypto_transport {
 	void *(*buffer)(void *ctx, unsigned int slot);
-	int (*transfer)(void *ctx, unsigned int slot, size_t length);
+	int (*submit)(void *ctx, unsigned int slot, size_t length);
+	int (*result)(void *ctx, unsigned int slot);
+	void (*stop)(void *ctx);
 	void (*release)(void *ctx, unsigned int slot, size_t length);
 	void *ctx;
 };
@@ -21,6 +25,7 @@ struct airoha_crypto_transport {
 struct airoha_crypto_engine *
 airoha_crypto_engine_register(struct device *dev,
 			      const struct airoha_crypto_transport *transport);
+void airoha_crypto_engine_notify(struct airoha_crypto_engine *engine);
 void airoha_crypto_engine_unregister(struct airoha_crypto_engine *engine);
 
 #endif

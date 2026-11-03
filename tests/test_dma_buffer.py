@@ -10,7 +10,7 @@ proto = proto[proto.index('int airoha_crypto_pack'):proto.index('MODULE_LICENSE'
 header = (root / 'linux/airoha_npu_crypto_proto.h').read_text()
 header = header[header.index('struct airoha_crypto_request {'):header.index('int airoha_crypto_pack')]
 platform = (root / 'linux/airoha_npu_platform.c').read_text()
-slots = platform[platform.index('static void *airoha_crypto_buffer'):platform.index('static int airoha_crypto_transfer')]
+slots = platform[platform.index('static void *airoha_crypto_buffer'):platform.index('static int airoha_crypto_submit')]
 source = r'''
 #include <assert.h>
 #include <stdbool.h>

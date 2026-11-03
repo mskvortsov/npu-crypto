@@ -66,12 +66,21 @@ struct airoha_profile_aggregate {
 #undef PROFILE_AGG_FIELD
 };
 
+struct airoha_crypto_transfer_state {
+	unsigned long deadline;
+	bool profile, interrupt;
+	u64 started, submitted;
+};
+
 struct airoha_crypto_dev {
 	struct device *dev;
 	void __iomem *regs;
 	void *bounce;
 	dma_addr_t dma;
 	struct airoha_crypto_engine *engine;
+	struct airoha_crypto_transfer_state
+		transfer[AIROHA_CRYPTO_NPU_BATCH_SIZE];
+	int irq;
 	bool poisoned;
 	spinlock_t profile_lock;
 	struct airoha_profile_aggregate profile[AIROHA_CRYPTO_NPU_BATCH_SIZE];
@@ -83,6 +92,7 @@ struct airoha_crypto_dev {
 static irqreturn_t airoha_crypto_irq(int irq, void *data)
 {
 	struct airoha_crypto_dev *npu = data;
+	struct airoha_crypto_engine *engine;
 	u32 ctrl;
 
 	if (!(readl(npu->regs + NPU_MBOX_INT_STATUS) & NPU_MBOX_HOST_BIT))
@@ -92,7 +102,16 @@ static irqreturn_t airoha_crypto_irq(int irq, void *data)
 	writel((ctrl & ~(NPU_STATUS_MASK << 2)) | NPU_DONE,
 	       npu->regs + NPU_MBOX_CTRL3(NPU_MBOX_NOTIFY));
 	atomic_inc(&npu->irq_count);
-	wake_up_all(&npu->completion_wait);
+	/* Probe self-tests run before the engine is published. Live traffic is
+	 * completed on the engine queue, without waking per-request sleepers.
+	 */
+	/* Kernel barrier macros intentionally accept a pointer-to-pointer. */
+	// NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion,bugprone-switch-missing-default-case)
+	engine = smp_load_acquire(&npu->engine);
+	if (engine)
+		airoha_crypto_engine_notify(engine);
+	else
+		wake_up(&npu->completion_wait);
 	return IRQ_HANDLED;
 }
 
@@ -177,18 +196,13 @@ static void airoha_crypto_release(void *context, unsigned int slot, size_t len)
 				 len);
 }
 
-static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
+static int airoha_crypto_submit(void *context, unsigned int slot, size_t len)
 {
 	struct airoha_crypto_dev *npu = context;
-	void *bounce;
-	dma_addr_t dma;
+	struct airoha_crypto_transfer_state *state;
 	unsigned int queue = AIROHA_CRYPTO_NPU_QUEUE(slot);
-	u32 ctrl, seq;
-	bool profile = READ_ONCE(npu_profile);
-	bool use_irq = READ_ONCE(npu_interrupt);
-	u64 started = profile ? ktime_get_ns() : 0;
-	u64 t1 = 0, t2 = 0, t3 = 0;
-	int ret;
+	dma_addr_t dma;
+	u32 seq;
 
 	if (READ_ONCE(npu->poisoned))
 		return -ENODEV;
@@ -196,51 +210,56 @@ static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
 		return -EINVAL;
 	if (len > AIROHA_CRYPTO_MAX_REQUEST)
 		return -EMSGSIZE;
-	/* Large requests use the trailer space; collect no sample for them. */
-	if (len > AIROHA_PROFILE_OFFSET)
-		profile = false;
-	bounce = npu->bounce + (size_t)slot * NPU_DMA_SLOT_SIZE;
+	state = &npu->transfer[slot];
+	/* Large requests use the profile trailer as payload. */
+	state->profile = READ_ONCE(npu_profile) && len <= AIROHA_PROFILE_OFFSET;
+	state->interrupt = READ_ONCE(npu_interrupt);
+	state->started = state->profile ? ktime_get_ns() : 0;
+	state->deadline = jiffies + usecs_to_jiffies(NPU_TIMEOUT_US);
 	dma = npu->dma + (size_t)slot * NPU_DMA_SLOT_SIZE;
-	if (profile)
-		t1 = ktime_get_ns();
 	dma_wmb();
 	writel(lower_32_bits(dma), npu->regs + NPU_MBOX_CTRL0(queue));
 	writel(len, npu->regs + NPU_MBOX_CTRL1(queue));
-	writel(NPU_WAIT | (profile ? AIROHA_PROFILE_FLAG : 0) |
-		       (use_irq ? AIROHA_INTERRUPT_FLAG : 0),
+	writel(NPU_WAIT | (state->profile ? AIROHA_PROFILE_FLAG : 0) |
+		       (state->interrupt ? AIROHA_INTERRUPT_FLAG : 0),
 	       npu->regs + NPU_MBOX_CTRL3(queue));
 	seq = readl(npu->regs + NPU_MBOX_CTRL2(queue));
 	writel(seq + 1, npu->regs + NPU_MBOX_CTRL2(queue));
-	if (profile)
-		t2 = ktime_get_ns();
-	if (use_irq) {
-		ret = wait_event_timeout(
-			      npu->completion_wait,
-			      (readl(npu->regs + NPU_MBOX_CTRL3(queue)) &
-			       NPU_DONE),
-			      usecs_to_jiffies(NPU_TIMEOUT_US)) ?
-			      0 :
-			      -ETIMEDOUT;
-		ctrl = readl(npu->regs + NPU_MBOX_CTRL3(queue));
-	} else {
-		ret = readl_poll_timeout(npu->regs + NPU_MBOX_CTRL3(queue),
-					 ctrl, ctrl & NPU_DONE, 10,
-					 NPU_TIMEOUT_US);
+	state->submitted = state->profile ? ktime_get_ns() : 0;
+	return 0;
+}
+
+static int airoha_crypto_timeout(struct airoha_crypto_dev *npu)
+{
+	/* The hart can still access its buffer. Quarantine the whole allocation. */
+	WRITE_ONCE(npu->poisoned, true);
+	dev_err(npu->dev, "crypto request timed out; DMA buffer quarantined\n");
+	return -ETIMEDOUT;
+}
+
+static int airoha_crypto_result(void *context, unsigned int slot)
+{
+	struct airoha_crypto_dev *npu = context;
+	struct airoha_crypto_transfer_state *state = &npu->transfer[slot];
+	void *bounce = npu->bounce + (size_t)slot * NPU_DMA_SLOT_SIZE;
+	bool profile = state->profile;
+	u64 completed;
+	u32 ctrl;
+
+	if (READ_ONCE(npu->poisoned))
+		return -ENODEV;
+	ctrl = readl(npu->regs + NPU_MBOX_CTRL3(AIROHA_CRYPTO_NPU_QUEUE(slot)));
+	if (!(ctrl & NPU_DONE)) {
+		if (time_after_eq(jiffies, state->deadline))
+			return airoha_crypto_timeout(npu);
+		return -EINPROGRESS;
 	}
-	if (ret) {
-		/* The hart can still access this buffer after a timeout. */
-		WRITE_ONCE(npu->poisoned, true);
-		dev_err(npu->dev,
-			"crypto request timed out; DMA buffer quarantined\n");
-		return ret;
-	}
-	if (profile)
-		t3 = ktime_get_ns();
+	completed = profile ? ktime_get_ns() : 0;
 	dma_rmb();
 	if (profile) {
 		struct airoha_profile_sample sample;
 		struct airoha_profile_aggregate *agg = &npu->profile[slot];
-		u64 host_ns = ktime_get_ns() - started;
+		u64 host_ns = completed - state->started;
 		unsigned long flags;
 
 		memcpy(&sample, bounce + AIROHA_PROFILE_OFFSET, sizeof(sample));
@@ -256,8 +275,8 @@ static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
 			max(agg->host_##name##_ns_max, ns); \
 	} while (0)
 		HOST_ACCUMULATE(copy_in, 0);
-		HOST_ACCUMULATE(submit, t2 - t1);
-		HOST_ACCUMULATE(poll, t3 - t2);
+		HOST_ACCUMULATE(submit, state->submitted - state->started);
+		HOST_ACCUMULATE(poll, completed - state->submitted);
 		HOST_ACCUMULATE(copy_out, 0);
 		HOST_ACCUMULATE(clear, 0);
 #undef HOST_ACCUMULATE
@@ -271,6 +290,48 @@ static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
 		spin_unlock_irqrestore(&npu->profile_lock, flags);
 	}
 	return (int)((ctrl >> 2) & NPU_STATUS_MASK);
+}
+
+/* Only probe self-tests wait synchronously; live requests use submit/result. */
+static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
+{
+	struct airoha_crypto_dev *npu = context;
+	u32 ctrl;
+	int ret;
+
+	ret = airoha_crypto_submit(npu, slot, len);
+	if (ret)
+		return ret;
+	if (npu->transfer[slot].interrupt) {
+		ret = wait_event_timeout(
+			      npu->completion_wait,
+			      readl(npu->regs +
+				    NPU_MBOX_CTRL3(
+					    AIROHA_CRYPTO_NPU_QUEUE(slot))) &
+				      NPU_DONE,
+			      usecs_to_jiffies(NPU_TIMEOUT_US)) ?
+			      0 :
+			      -ETIMEDOUT;
+	} else {
+		ret = readl_poll_timeout(
+			npu->regs +
+				NPU_MBOX_CTRL3(AIROHA_CRYPTO_NPU_QUEUE(slot)),
+			ctrl, ctrl & NPU_DONE, 10, NPU_TIMEOUT_US);
+	}
+	return ret ? airoha_crypto_timeout(npu) :
+		     airoha_crypto_result(npu, slot);
+}
+
+static void airoha_crypto_stop(void *context)
+{
+	struct airoha_crypto_dev *npu = context;
+
+	writel(0, npu->regs + NPU_MBOX_INT_MASK0);
+	/* Remove our shared handler as well as synchronizing it: another device
+	 * may otherwise invoke it after the engine has been freed.
+	 */
+	devm_free_irq(npu->dev, npu->irq, npu);
+	npu->engine = NULL;
 }
 
 /* Exercise each firmware packet group through the same DMA/mailbox transport
@@ -424,6 +485,7 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct airoha_crypto_transport transport;
+	struct airoha_crypto_engine *engine;
 	struct airoha_crypto_dev *npu;
 	int ret, irq;
 
@@ -443,6 +505,7 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	npu->irq = irq;
 	ret = devm_request_irq(dev, irq, airoha_crypto_irq, IRQF_SHARED,
 			       "airoha-npu-crypto", npu);
 	if (ret)
@@ -471,14 +534,19 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	if (ret)
 		goto free_dma;
 	transport.buffer = airoha_crypto_buffer;
-	transport.transfer = airoha_crypto_transfer;
+	transport.submit = airoha_crypto_submit;
+	transport.result = airoha_crypto_result;
+	transport.stop = airoha_crypto_stop;
 	transport.release = airoha_crypto_release;
 	transport.ctx = npu;
-	npu->engine = airoha_crypto_engine_register(dev, &transport);
-	if (IS_ERR(npu->engine)) {
-		ret = (int)PTR_ERR(npu->engine);
+	engine = airoha_crypto_engine_register(dev, &transport);
+	if (IS_ERR(engine)) {
+		ret = (int)PTR_ERR(engine);
 		goto free_dma;
 	}
+	/* Publish the initialized queue before an IRQ can notify it. */
+	// NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion,bugprone-switch-missing-default-case)
+	smp_store_release(&npu->engine, engine);
 	platform_set_drvdata(pdev, npu);
 	npu->profile_dir = debugfs_create_dir("airoha_npu_crypto", NULL);
 	debugfs_create_file("profile", 0444, npu->profile_dir, npu,

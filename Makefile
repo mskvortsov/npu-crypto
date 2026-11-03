@@ -23,6 +23,8 @@ format-linux:
 format-check-linux:
 	$(CLANG_FORMAT) --dry-run --Werror $(LINUX_FORMAT_SOURCES)
 test:
+	python3 tests/test_engine_async.py
+	python3 tests/test_transport_async.py
 	python3 tests/test_dma_buffer.py
 	python3 tests/test_wireguard_async.py
 	python3 tests/test_crypto.py

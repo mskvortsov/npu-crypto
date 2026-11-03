@@ -156,8 +156,9 @@ workload and subtract the counts and sums to isolate that workload. Maxima are
 cumulative since driver probe and cannot be subtracted. Divide a sum difference
 by the count difference for the mean per profiled request. Firmware values are
 `mcycle` ticks, and Linux host values are nanoseconds; converting cycles to time
-requires the NPU clock rate. The host measurement covers the transfer function,
-including submission and completion waiting, but excluding packing and unpacking. Firmware `total` covers request execution but
+requires the NPU clock rate. The host measurement covers submission through completion processing,
+including completion delivery and queue scheduling, but excluding packing and
+unpacking. Firmware `total` covers request execution but
 excludes mailbox detection and publishing the completion. The leader and wait
 intervals are included in the corresponding ChaCha20 and Poly1305 totals.
 The wait interval begins after the leader's work and ends after every worker
@@ -177,12 +178,28 @@ and may include preemption. Samples cover completed transfers; timeouts are not
 included. The total also includes validation and timing overhead, so it need not
 equal the sum of stage times.
 
-The `npu_interrupt` module parameter selects completion handling: `1` uses the
-queue 8 host interrupt (default), and `0` uses the previous polling path. Each
-request keeps the mode selected when it was submitted. The startup self-test
-checks that the expected completion interrupts are delivered when interrupt
-mode is enabled. `host_poll` in the profile is the completion-wait interval in
-either mode; in interrupt mode it includes interrupt delivery and scheduling.
+Live requests use separate nonblocking submit and result operations. An
+ordered engine workqueue serializes slot bookkeeping, packing, and unpacking,
+while the NPU processes all configured slots concurrently. Submission returns
+without sleeping for hardware. The queue 8 host interrupt schedules one shared
+completion worker, which checks the active slots, completes only finished
+requests, and admits queued backlog requests. Repeated or coalesced interrupts
+are safe. No per-request worker waits on a completion wait queue. During
+removal, accepted requests drain before the IRQ handler and watchdog are
+removed and the workqueue is destroyed.
+
+The `npu_interrupt` module parameter selects notification: `1` requests the
+queue 8 host interrupt (default). A shared delayed-work watchdog checks active
+slots once per kernel tick, recovers missed interrupts and detects the
+one-second timeout. A timeout quarantines the entire DMA allocation and fails
+all outstanding requests without unpacking or clearing their buffers.
+With `npu_interrupt=0`, live requests rely on that watchdog for polling, which
+adds up to one tick of detection latency; use interrupt mode for throughput
+tests. Each request keeps the notification mode selected at submission.
+Only probe self-tests still use the synchronous interrupt/polling wrapper.
+The startup self-test checks the expected completion interrupts when enabled.
+`host_poll` is elapsed wall time from submission to completion processing,
+including firmware execution, interrupt delivery and workqueue scheduling.
 
 The dedicated firmware uses the Cryptogams scalar RV32 Poly1305 block routine
 for message segments. Its accumulator is converted for the existing parallel combiner;
