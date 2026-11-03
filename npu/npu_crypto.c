@@ -218,7 +218,6 @@ static void poly1305_emit_generic(void *ctx, u8 mac[16], const u32 nonce[4])
 
 static void clear_bytes(void *p, u32 len);
 
-#ifdef NPU_CHACHA_ASM
 extern void ChaCha20_ctr32(u8 *dst, const u8 *src, u32 len,
 			   const u32 key[8], const u32 counter[4]);
 
@@ -246,50 +245,6 @@ static void chacha_block(u8 out[64], const u8 key[32], const u8 nonce[12],
 
 	chacha_asm_xor(out, zero, 64, key, nonce, counter);
 }
-#else
-static u32 rol(u32 x, u32 n)
-{
-	return (x << n) | (x >> (32 - n));
-}
-
-#define QR(a, b, c, d) do { \
-	a += b; d = rol(d ^ a, 16); c += d; b = rol(b ^ c, 12); \
-	a += b; d = rol(d ^ a, 8); c += d; b = rol(b ^ c, 7); \
-} while (0)
-
-static void chacha_block(u8 out[64], const u8 key[32], const u8 nonce[12],
-			 u32 counter)
-{
-	u32 s[16], x[16], i;
-
-	s[0] = 0x61707865; s[1] = 0x3320646e;
-	s[2] = 0x79622d32; s[3] = 0x6b206574;
-	for (i = 0; i < 8; i++)
-		s[4 + i] = get_unaligned_le32(key + 4 * i);
-	s[12] = counter;
-	for (i = 0; i < 3; i++)
-		s[13 + i] = get_unaligned_le32(nonce + 4 * i);
-	for (i = 0; i < 16; i++)
-		x[i] = s[i];
-	for (i = 0; i < 10; i++) {
-		QR(x[0], x[4], x[8], x[12]);
-		QR(x[1], x[5], x[9], x[13]);
-		QR(x[2], x[6], x[10], x[14]);
-		QR(x[3], x[7], x[11], x[15]);
-		QR(x[0], x[5], x[10], x[15]);
-		QR(x[1], x[6], x[11], x[12]);
-		QR(x[2], x[7], x[8], x[13]);
-		QR(x[3], x[4], x[9], x[14]);
-	}
-	for (i = 0; i < 16; i++)
-		put_unaligned_le32(x[i] + s[i], out + 4 * i);
-	/* Prevent key-derived state from remaining on the stack. */
-	for (i = 0; i < 16; i++) {
-		((volatile u32 *)s)[i] = 0;
-		((volatile u32 *)x)[i] = 0;
-	}
-}
-#endif
 
 static void poly_padded(struct poly1305_internal *st, const u8 *p, u32 len)
 {
@@ -312,7 +267,6 @@ static void clear_bytes(void *p, u32 len)
 		*v++ = 0;
 }
 
-#ifdef NPU_POLY1305_ASM
 /* Cryptogams RV32 uses four 32-bit words plus a high word for h, while the
  * parallel combiner uses five radix-2^26 limbs. */
 struct segment_poly { u32 words[12]; };
@@ -363,15 +317,6 @@ static void segment_result(struct segment_poly *st, u32 out[5])
 	out[3] = ((h[2] >> 14) | (h[3] << 18)) & 0x3ffffff;
 	out[4] = (h[3] >> 8) | (h[4] << 24);
 }
-#else
-struct segment_poly { struct poly1305_internal poly; };
-static void segment_init(struct segment_poly *st, const u8 *key)
-{ poly1305_init_generic(&st->poly, key); }
-static void segment_blocks(struct segment_poly *st, const u8 *p, u32 len)
-{ poly1305_blocks_generic(&st->poly, p, len, 1); }
-static void segment_result(struct segment_poly *st, u32 out[5])
-{ u32 i; for (i = 0; i < 5; i++) out[i] = st->poly.h[i]; }
-#endif
 
 static void segment_data(struct segment_poly *poly, const u8 *src, u32 len,
 			 u32 *scratch, u32 scratch_len)
@@ -557,7 +502,6 @@ void npu_chacha20_xor_range(u8 *dst, const u8 *src, u32 len,
 			    const u8 key[32], const u8 nonce[12],
 			    u32 first_block, u32 end_block)
 {
-#ifdef NPU_CHACHA_ASM
 	u32 first, end;
 
 	if (!len || end_block <= first_block || first_block > (len - 1) / 64)
@@ -566,21 +510,6 @@ void npu_chacha20_xor_range(u8 *dst, const u8 *src, u32 len,
 	end = end_block > len / 64 ? len : end_block * 64;
 	chacha_asm_xor(dst + first, src + first, end - first, key, nonce,
 		       first_block + 1);
-#else
-	u8 block[64];
-	u32 index, off, n, i;
-
-	for (index = first_block; index < end_block; index++) {
-		off = index * 64;
-		if (off >= len)
-			break;
-		chacha_block(block, key, nonce, index + 1);
-		n = len - off < 64 ? len - off : 64;
-		for (i = 0; i < n; i++)
-			dst[off + i] = src[off + i] ^ block[i];
-	}
-	clear_bytes(block, sizeof(block));
-#endif
 }
 
 static void chacha_xor_serial(u8 *dst, const u8 *src, u32 len,

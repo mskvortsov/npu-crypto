@@ -1,0 +1,24 @@
+# The module is built for the OpenWrt ARM64 kernel. These paths refer to the
+# configured and built /w/openwrt-nokia tree used by deploy.sh.
+CompileFlags:
+  Compiler: clang
+  Add:
+    - --target=aarch64-linux-gnu
+    - -D__KERNEL__
+    - -DMODULE
+    - -std=gnu11
+    - -fno-builtin
+    - -Wno-unknown-warning-option
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/arch/arm64/include
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/arch/arm64/include/generated
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/arch/arm64/include/uapi
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/arch/arm64/include/generated/uapi
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include/uapi
+    - -I/w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include/generated/uapi
+    - -include
+    - /w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include/linux/compiler-version.h
+    - -include
+    - /w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include/linux/kconfig.h
+    - -include
+    - /w/openwrt-nokia/build_dir/target-aarch64_cortex-a53_musl/linux-airoha_an7581/linux-6.18.60/include/linux/compiler_types.h

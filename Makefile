@@ -2,7 +2,7 @@
 .PHONY: all crypto-firmware test
 all: crypto-firmware
 crypto-firmware:
-	$(MAKE) -f crypto_standalone/Makefile
+	$(MAKE) -f npu/firmware.mk
 test:
 	python3 tests/test_crypto.py
 	python3 tests/test_crypto_request.py

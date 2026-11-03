@@ -1,6 +1,6 @@
 # ChaCha20-Poly1305
 
-`npu_crypto.c` contains an RFC 8439 ChaCha20-Poly1305 AEAD core. It accepts
+`npu/npu_crypto.c` contains an RFC 8439 ChaCha20-Poly1305 AEAD core. It accepts
 32-byte keys, 12-byte nonces and associated data. Decryption checks the tag
 before writing plaintext. Input and output must be identical or disjoint.
 
@@ -23,7 +23,7 @@ must keep the DMA buffer alive and unmodified until completion; a timeout
 alone does not stop the hart.
 
 Run `python3 tests/test_crypto.py` from the repository root. The test needs
-`cc` and Python's `cryptography` package; it compares randomized inputs
+`cc`, OpenSSL development headers and library, and Python's `cryptography` package; it compares randomized inputs
 against that implementation, tests in-place operation and checks that a bad
 tag leaves the ciphertext unchanged. The core also compiles for RV32 as part of the dedicated firmware build.
 
@@ -47,8 +47,8 @@ start before publishing readiness. If a hart does not start, the driver times
 out and WireGuard can use software crypto. Each group uses the mailbox queue
 whose index equals its leader's hart ID, with the request layout above.
 For each request, the host writes CTRL0 (DMA address), CTRL1 (buffer size), and
-CTRL3 (1: slot 0, blocking), in that order, then increments CTRL2 as the final
-doorbell write. It must serialize requests per queue and wait for CTRL3 bit 1 before
+CTRL3 (bit 0 set, plus optional profiling bit 6 and interrupt bit 7), in
+that order, then increments CTRL2 as the final doorbell write. It must serialize requests per queue and wait for CTRL3 bit 1 before
 reading status and the DMA buffer. The firmware polls the doorbell and writes
 status in CTRL3 bits 4:2. This ordering differs from the existing host
 mailbox helper. Host DMA and MMIO ordering must be enforced by the driver.
@@ -58,8 +58,10 @@ version, operation, data length and associated-data length are four
 little-endian words at offsets 0, 4, 8 and 12; nonce, key and tag are at
 16, 28 and 60. The associated data immediately follows the header and the
 in-place data follows that. The mailbox length covers all three. Version 1
-remains accepted. The sum must fit in the mailbox's 16-bit length field and
-the data portion remains limited to 16384 bytes.
+remains accepted. The dedicated service limits the whole request to 16460
+bytes, including its header. For version 2, associated data plus payload must
+therefore fit within 16384 bytes; the payload alone is also limited to 16384
+bytes. The mailbox length field is 16 bits.
 
 `python3 tests/test_crypto_request.py` exercises both associated-data and
 payload boundaries through the version 2 request processor. It does not test
@@ -68,9 +70,11 @@ mailbox registers, DMA, or an NPU hart.
 `linux/airoha_npu_crypto_proto.c` marshals Linux scatterlists into version 2
 requests. `linux/airoha_npu_engine.c` registers an asynchronous AEAD algorithm
 under the private name `airoha-npu-chacha20poly1305`. The platform driver in
-`linux/airoha_npu_platform.c` loads `airoha/an7581_crypto.bin` and owns queue 0.
-It uses a coherent bounce buffer and permanently quarantines it after a
-timeout, because no hart stop sequence has been verified. It refuses to probe
+`linux/airoha_npu_platform.c` loads `airoha/an7581_crypto.bin` and uses one
+mailbox queue and one coherent bounce-buffer slot per packet group. Queue 8
+provides shared host interrupt notification. A timeout poisons the device, so
+subsequent transfers are refused, and the coherent buffer allocation is retained
+because no hart stop sequence has been verified. It refuses to probe
 if an enabled network device still references the same NPU. A crypto-only
 device tree must remove those references and cannot use NPU PPE offload.
 
@@ -83,29 +87,32 @@ crypto-only device tree. Basic firmware, DMA transport and WireGuard traffic hav
 
 The dedicated firmware processes each request in place in its host DMA bounce
 buffer through the NPU's uncached alias. Linux owns the slot until the NPU
-completes and clears the buffer after copying the result. A timed-out slot is
-quarantined because firmware may still access it. Requests larger than the
+completes and clears the buffer after copying the result. After a timeout the
+whole allocation is retained because firmware may still access a slot. Requests larger than the
 firmware request limit are rejected. Run `python3 tests/test_crypto_scratch.py`
 to test boundary lengths and authentication failure without buffer modification;
 hardware cache and DMA behavior are not covered by that test.
 
-Run `tests/test_crypto_qemu.sh` to exercise the cooperative ChaCha20 path on
-eight emulated RV32 harts with known authenticated ciphertexts, associated
-data, and altered tags. This does not
-validate the AN7581 boot registers, SRAM ordering, or hardware performance.
+Run `tests/test_crypto_qemu.sh` to exercise the firmware's assembly crypto
+and service on emulated RV32 harts for all four batch sizes. It tests 40 AEAD
+vectors per packet group, including associated data, altered tags, unaligned
+buffers, in-place operation and nonzero starting counters. It also runs 100
+concurrent mailbox encrypt/decrypt rounds per batch size, with a ninth emulated
+hart acting as the host. QEMU does not validate the AN7581 boot registers,
+physical mailbox or mutex behavior, SRAM ordering, or hardware performance.
 
 Run `python3 tests/test_poly_parallel.py` to compare 500 chunked Poly1305
 requests with an independent ChaCha20-Poly1305 implementation. The tests do
 not measure AN7581 hardware performance.
 
 The dedicated image uses the scalar RV32 `ChaCha20_ctr32` generated from
-`crypto_standalone/cryptogams/chacha-riscv.pl`. Each hart passes its contiguous
+`npu/cryptogams/chacha-riscv.pl`. Each hart passes its contiguous
 block range and starting counter; the wrapper copies keys and nonce words into
 aligned local arrays. The scalar epilogue clears its 64-byte state buffer, and
-the wrapper clears its key and counter arrays. The portable C implementation is also used by the host tests. The Cryptogams license is in
-`crypto_standalone/cryptogams/LICENSE` and is included in the OpenWrt package.
-The QEMU test exercises 40 AEAD vectors, bad tags, unaligned buffers and
-in-place operation with nonzero starting counters.
+the wrapper clears its key and counter arrays. Native tests use a test-only
+OpenSSL ChaCha20 adapter; QEMU tests execute the RISC-V assembly. The
+Cryptogams license is in `npu/cryptogams/LICENSE` and is included in the
+OpenWrt package.
 
 By default, the Linux engine admits four NPU requests at a time. The writable
 `npu_enable` module parameter controls NPU use at runtime. When enabled, only
@@ -115,7 +122,8 @@ ChaCha20-Poly1305 path, which may use NEON. Set
 `/sys/module/airoha_npu_crypto/parameters/npu_enable` to `0` to send all
 requests through that software path, or `1` to enable the size threshold again.
 If the NPU is already busy, `npu_fallback` selects software fallback when set
-or waiting for a free slot when cleared.
+or queues the request for a free slot when cleared. When `npu_enable` is `0`,
+`npu_fallback` has no effect. Both parameters default to `1`.
 The read-only parameters `npu_submitted` and
 `npu_busy` count accepted and busy-rejected requests respectively since the
 module was loaded; requests skipped because they are small or NPU use is
@@ -139,7 +147,7 @@ cumulative since driver probe and cannot be subtracted. Divide a sum difference
 by the count difference for the mean per profiled request. Firmware values are
 `mcycle` ticks, and Linux host values are nanoseconds; converting cycles to time
 requires the NPU clock rate. The host measurement covers the transfer function,
-including host copies and polling. Firmware `total` covers request execution but
+including host copies and completion waiting. Firmware `total` covers request execution but
 excludes mailbox detection and publishing the completion. The leader and wait
 intervals are included in the corresponding ChaCha20 and Poly1305 totals.
 The wait interval begins after the leader's work and ends after every worker
@@ -165,8 +173,7 @@ mode is enabled. `host_poll` in the profile is the completion-wait interval in
 either mode; in interrupt mode it includes interrupt delivery and scheduling.
 
 The dedicated firmware uses the Cryptogams scalar RV32 Poly1305 block routine
-by default. Its accumulator is converted for the existing parallel combiner;
+for message segments. Its accumulator is converted for the existing parallel combiner;
 unaligned input is copied in 16-byte chunks to avoid reads outside the input.
-Build the firmware with `NPU_POLY1305_ASM=0` to use the portable C segment
-backend. The QEMU suite runs both backends for every batch size. QEMU validates
+The QEMU suite tests the assembly for every batch size. QEMU validates
 correctness but does not predict AN7581 performance.

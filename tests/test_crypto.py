@@ -15,7 +15,7 @@ def buf(data):
 with tempfile.TemporaryDirectory() as tmp:
     lib = os.path.join(tmp, 'crypto.so')
     subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
-                    '-o', lib, 'npu_crypto.c'], check=True)
+                    '-o', lib, 'npu/npu_crypto.c', 'tests/chacha_openssl.c', 'tests/poly1305_openssl.c', '-lcrypto'], check=True)
     crypt = ctypes.CDLL(lib).npu_chacha20poly1305
     for length in (0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 1500, 65535):
         for aad_len in (0, 1, 15, 16, 17, 65):

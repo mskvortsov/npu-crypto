@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory() as tmp:
     path = os.path.join(tmp, 'crypto.so')
     subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
                     '-DAN7581', '-DNOWIFI', '-DNPU_CRYPTO_TEST',
-                    '-o', path, 'npu_crypto.c'], check=True)
+                    '-o', path, 'npu/npu_crypto.c', 'tests/chacha_openssl.c', 'tests/poly1305_openssl.c', '-lcrypto'], check=True)
     process = ctypes.CDLL(path).npu_crypto_process
     process.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     for size in (0, 1, 15, 16, 17, 64, 1500):

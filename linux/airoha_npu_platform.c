@@ -17,7 +17,7 @@
 #include "airoha_npu_crypto_proto.h"
 #include "airoha_npu_engine.h"
 #include "airoha_npu_test_vector.h"
-#include "../npu_crypto_profile.h"
+#include "../npu/npu_crypto_profile.h"
 
 #define NPU_FW_NAME "airoha/an7581_crypto.bin"
 #define NPU_FW_ADDR 0x84000000

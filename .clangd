@@ -1,0 +1,21 @@
+# Firmware runs bare-metal on the AN7581 RV32 NPU.
+If:
+  PathMatch: npu/.*\.(c|h)
+CompileFlags:
+  Compiler: clang
+  Add:
+    - --target=riscv32-unknown-elf
+    - -march=rv32imc_zicsr_zifencei
+    - -mabi=ilp32
+    - -ffreestanding
+    - -fno-builtin
+    - -DAN7581
+    - -DNOWIFI
+    - -Inpu
+    - -Wall
+    - -Wextra
+---
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  Add: [-xc]

@@ -12,7 +12,8 @@ with tempfile.TemporaryDirectory() as tmp:
     lib = os.path.join(tmp, 'crypto.so')
     subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
                     '-DAN7581', '-DNOWIFI', '-DNPU_CRYPTO_TEST', '-I.',
-                    '-o', lib, 'npu_crypto.c', 'crypto_standalone/service.c'],
+                    '-o', lib, 'npu/npu_crypto.c', 'npu/npu_service.c',
+                    'tests/chacha_openssl.c', 'tests/poly1305_openssl.c', '-lcrypto'],
                    check=True)
     driver = ctypes.CDLL(lib)
     request = driver.npu_crypto_test_request
