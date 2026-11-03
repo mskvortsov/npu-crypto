@@ -6,14 +6,18 @@ if [ "$#" -gt 1 ]; then echo "Usage: $0 [openwrt-tree]" >&2; exit 2; fi
 if [ "$#" -eq 1 ]; then
     [ -f "$1/rules.mk" ] || { echo "Not an OpenWrt tree: $1" >&2; exit 1; }
     dest=$1/package/kernel/airoha-npu-crypto
+    patch_dir=$1/target/linux/airoha/patches-6.18
 else
     dest=$root/openwrt/package/kernel/airoha-npu-crypto
+    patch_dir=$root/openwrt/target/linux/airoha/patches-6.18
 fi
-mkdir -p "$dest/src/npu/cryptogams" "$dest/src/linux"
-cp "$root/openwrt/package.mk" "$dest/Makefile.tmp"
-mv "$dest/Makefile.tmp" "$dest/Makefile"
-cp "$root"/npu/npu_crypto.c "$root"/npu/npu_crypto.h "$root"/npu/npu_crypto_config.h "$root"/npu/npu_crypto_profile.h "$root"/npu/npu_regs.h "$root"/npu/npu_types.h "$root"/npu/link.ld "$dest/src/npu/"
-cp "$root"/npu/firmware.mk "$root"/npu/npu_service.c "$root"/npu/npu_start.S "$dest/src/npu/"
-cp "$root"/npu/cryptogams/LICENSE "$root"/npu/cryptogams/chacha-riscv.pl "$root"/npu/cryptogams/poly1305-riscv.pl "$dest/src/npu/cryptogams/"
-cp "$root"/linux/Makefile "$root"/linux/airoha_npu_crypto_proto.c "$root"/linux/airoha_npu_crypto_proto.h "$root"/linux/airoha_npu_engine.c "$root"/linux/airoha_npu_engine.h "$root"/linux/airoha_npu_platform.c "$root"/linux/airoha_npu_test_vector.h "$dest/src/linux/"
+
+mkdir -p "$dest/src/"
+cp "$root/openwrt/package.mk" "$dest/Makefile"
+cp -r "$root/npu" "$dest/src/"
+cp -r "$root/linux" "$dest/src/"
+mkdir -p "$patch_dir"
+cp "$root/linux/wireguard-offload.patch" "$patch_dir/932-wireguard-add-airoha-npu-offload.patch"
+
 echo "Updated $dest"
+echo "Updated $patch_dir/932-wireguard-add-airoha-npu-offload.patch"
