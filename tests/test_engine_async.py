@@ -18,13 +18,13 @@ def block(start):
     return engine[pos:end]
 
 source = (root / 'tests/engine_async_stubs.h').read_text()
-for name in ('airoha_crypto_engine', 'airoha_crypto_ctx', 'airoha_crypto_work'):
+for name in ('airoha_crypto_slot', 'airoha_crypto_engine', 'airoha_crypto_ctx', 'airoha_crypto_work'):
     source += block('struct ' + name + ' {') + ';\n'
 source += '''
 static atomic_t npu_submitted, npu_busy;
 static bool npu_enable = true;
 static void airoha_do_work(struct work_struct *work);
-void airoha_crypto_engine_notify(struct airoha_crypto_engine *e);
+void airoha_crypto_engine_notify(struct airoha_crypto_engine *e, unsigned slots);
 '''
 for signature in (
     'static int airoha_reserve_slot(', 'static int airoha_enqueue(',

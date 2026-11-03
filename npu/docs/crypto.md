@@ -178,15 +178,21 @@ and may include preemption. Samples cover completed transfers; timeouts are not
 included. The total also includes validation and timing overhead, so it need not
 equal the sum of stage times.
 
-Live requests use separate nonblocking submit and result operations. An
-ordered engine workqueue serializes slot bookkeeping, packing, and unpacking,
-while the NPU processes all configured slots concurrently. Submission returns
-without sleeping for hardware. The queue 8 host interrupt schedules one shared
-completion worker, which checks the active slots, completes only finished
-requests, and admits queued backlog requests. Repeated or coalesced interrupts
-are safe. No per-request worker waits on a completion wait queue. During
+Live requests use separate nonblocking submit and result operations. Each
+slot has its own ordered workqueue, allowing packing, unpacking and hardware
+processing across slots to run concurrently. Submission and completion for the
+same slot remain serialized, including interrupts arriving before submit returns.
+Submission returns without sleeping for hardware. The queue 8 host interrupt
+reads the submitted slots' mailbox statuses and schedules completion workers
+only for slots reporting DONE. A per-slot pending bit is published after clearing
+the previous DONE and before ringing the submission doorbell, and cleared when
+the result is consumed. Persistent DONE statuses on idle slots therefore do not
+cause unnecessary worker wakeups. Completion workers unpack results and admit
+queued backlog requests. Only the shared backlog and slot reservation
+use the engine spinlock; DMA copies and callbacks run outside it. Repeated or
+coalesced interrupts are safe. No per-request worker waits on a completion wait queue. During
 removal, accepted requests drain before the IRQ handler and watchdog are
-removed and the workqueue is destroyed.
+removed and all slot workqueues are destroyed.
 
 The `npu_interrupt` module parameter selects notification: `1` requests the
 queue 8 host interrupt (default). A shared delayed-work watchdog checks active

@@ -47,7 +47,7 @@ typedef int irqreturn_t;
 #define max_t(t,a,b) max((t)(a),(t)(b))
 #define memzero_explicit(p,n) memset(p,0,n)
 #define dev_err(...) (++error_logs)
-static unsigned error_logs, notifications, wakeups, irq_freed, barriers;
+static unsigned error_logs, notifications, wakeups, irq_freed, barriers, notified_slots;
 static bool npu_profile, npu_interrupt=true;
 static unsigned long jiffies;
 static u64 clock_ns;
@@ -55,10 +55,19 @@ static u64 ktime_get_ns(void) { clock_ns+=10; return clock_ns; }
 static void dma_wmb(void) { barriers++; }
 static void dma_rmb(void) { barriers++; }
 static u32 readl(void *p) { return *(u32 *)p; }
-static void writel(u32 v,void *p) { *(u32 *)p=v; }
+static void (*write_hook)(void *,u32);
+static void writel(u32 v,void *p) {
+    *(u32 *)p=v;
+    if (write_hook) write_hook(p,v);
+}
 static void atomic_inc(int *a) { ++*a; }
+static int atomic_read(int *a) { return *a; }
+static void atomic_or(unsigned mask,int *a) { *a |= mask; }
+static void atomic_andnot(unsigned mask,int *a) { *a &= ~mask; }
 static void wake_up(int *w) { (void)w; wakeups++; }
-static void airoha_crypto_engine_notify(void *e) { assert(e); notifications++; }
+static void airoha_crypto_engine_notify(void *e,unsigned slots) {
+    assert(e); notifications++; notified_slots=slots;
+}
 static void devm_free_irq(void *d,int irq,void *npu) {
     (void)d; (void)npu; assert(irq==42); irq_freed++;
 }
@@ -74,6 +83,20 @@ for signature in ('static irqreturn_t airoha_crypto_irq(',
                   'static int airoha_crypto_result(', 'static void airoha_crypto_stop('):
     source += block(signature) + '\n'
 source += r'''
+static struct airoha_crypto_dev *hook_npu;
+static void early_completion(void *p,u32 value)
+{
+    (void)value;
+    if (p!=hook_npu->regs+NPU_MBOX_CTRL2(AIROHA_CRYPTO_NPU_QUEUE(2))) return;
+    write_hook=NULL;
+    assert(hook_npu->pending_slots==BIT(2));
+    assert(readl(hook_npu->regs+NPU_MBOX_CTRL3(AIROHA_CRYPTO_NPU_QUEUE(2)))==
+           (NPU_WAIT|AIROHA_INTERRUPT_FLAG));
+    writel(NPU_DONE|(1<<2),hook_npu->regs+NPU_MBOX_CTRL3(AIROHA_CRYPTO_NPU_QUEUE(2)));
+    writel(NPU_MBOX_HOST_BIT,hook_npu->regs+NPU_MBOX_INT_STATUS);
+    assert(airoha_crypto_irq(42,hook_npu)==IRQ_HANDLED);
+    assert(notified_slots==BIT(2));
+}
 int main(void)
 {
     struct airoha_crypto_dev npu={.regs=calloc(1,0x310000),
@@ -89,6 +112,7 @@ int main(void)
         assert(readl(npu.regs+NPU_MBOX_CTRL2(q))==1);
         assert(readl(npu.regs+NPU_MBOX_CTRL3(q))==(NPU_WAIT|AIROHA_INTERRUPT_FLAG));
         assert(airoha_crypto_result(&npu,slot)==-EINPROGRESS);
+        assert(npu.pending_slots & BIT(slot));
         assert(((u32 *)p)[0]==0x5a5a5a5a);
     }
     assert(airoha_crypto_irq(42,&npu)==IRQ_NONE);
@@ -97,18 +121,37 @@ int main(void)
     assert(wakeups==1 && !notifications); /* Probe self-test only. */
     npu.engine=(void *)1;
     assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
-    assert(wakeups==1 && notifications==1);
+    assert(wakeups==1 && notifications==1 && !notified_slots);
+    /* One completion must not wake three still-pending slots. */
+    writel(NPU_DONE|(1<<2),npu.regs+NPU_MBOX_CTRL3(0));
+    assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
+    assert(notified_slots==BIT(0));
+    /* Coalesced completions select both slots, including bad-tag results. */
+    writel(NPU_DONE|(2<<2),npu.regs+NPU_MBOX_CTRL3(2));
+    assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
+    assert(notified_slots==(BIT(0)|BIT(1)));
     writel(NPU_DONE|(1<<2),npu.regs+NPU_MBOX_CTRL3(0));
     assert(airoha_crypto_result(&npu,0)==1);
+    assert(!(npu.pending_slots & BIT(0)));
+    assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
+    assert(notified_slots==BIT(1)); /* Ignore persistent DONE while unpacking. */
     airoha_crypto_release(&npu,0,1496);
     assert(!*(u32 *)npu.bounce);
     assert(*(u32 *)(npu.bounce+NPU_DMA_SLOT_SIZE)==0x5a5a5a5a);
     writel(NPU_DONE|(2<<2),npu.regs+NPU_MBOX_CTRL3(2));
     assert(airoha_crypto_result(&npu,1)==2); /* Authentication failure. */
+    assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
+    assert(!notified_slots); /* Idle slots with stale DONE stay asleep. */
+    /* Reusing a completed slot must replace the old DONE with WAIT. */
+    assert(!airoha_crypto_submit(&npu,0,1496));
+    assert(airoha_crypto_irq(42,&npu)==IRQ_HANDLED);
+    assert(!notified_slots);
     jiffies=npu.transfer[2].deadline;
     assert(airoha_crypto_result(&npu,2)==-ETIMEDOUT);
     assert(npu.poisoned && error_logs==1);
+    assert(!(npu.pending_slots & BIT(2)));
     assert(airoha_crypto_result(&npu,3)==-ENODEV);
+    assert(!(npu.pending_slots & BIT(3)));
     assert(airoha_crypto_submit(&npu,0,1496)==-ENODEV);
     assert(!airoha_crypto_buffer(&npu,0));
     airoha_crypto_release(&npu,3,1496);
@@ -137,6 +180,14 @@ int main(void)
     jiffies=npu.transfer[0].deadline;
     assert(airoha_crypto_result(&npu,0)==-ETIMEDOUT);
     assert(barriers>=8);
+    /* Firmware completes inside the doorbell write, before submit returns. */
+    npu.poisoned=false; npu_profile=false; npu_interrupt=true;
+    npu.pending_slots=0; npu.engine=(void *)1;
+    hook_npu=&npu; write_hook=early_completion;
+    assert(!airoha_crypto_submit(&npu,2,1496));
+    assert(!write_hook && notified_slots==BIT(2));
+    assert(airoha_crypto_result(&npu,2)==1);
+    assert(!npu.pending_slots);
     free(npu.regs); free(npu.bounce);
 }
 '''

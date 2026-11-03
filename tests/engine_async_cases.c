@@ -1,5 +1,16 @@
 static struct airoha_crypto_engine engine;
-static struct workqueue_struct queue;
+static struct workqueue_struct queues[4];
+static void run_all(void) {
+    bool pending;
+    do {
+        pending=false;
+        for (unsigned i=0;i<4;i++) {
+            run_queue(&queues[i]);
+            pending |= queues[i].count != 0;
+        }
+        for (unsigned i=0;i<4;i++) pending |= queues[i].count != 0;
+    } while (pending);
+}
 static struct airoha_crypto_ctx ctx;
 static struct crypto_aead tfm;
 static u8 buffers[4][17000];
@@ -16,7 +27,7 @@ static int submit(void *unused,unsigned slot,size_t len) {
     if (submit_error) return submit_error;
     submitted[slot]++;
     statuses[slot]=early_irq ? 1 : -EINPROGRESS;
-    if (early_irq) airoha_crypto_engine_notify(&engine);
+    if (early_irq) airoha_crypto_engine_notify(&engine, BIT(slot));
     return 0;
 }
 static int result(void *unused,unsigned slot) {
@@ -39,15 +50,19 @@ static void aead_request_complete(struct aead_request *req,int err) {
     free(req);
 }
 static void reset(void) {
-    assert(!queue.count);
-    memset(&engine,0,sizeof(engine)); memset(&queue,0,sizeof(queue));
+    for (unsigned i=0;i<4;i++) assert(!queues[i].count);
+    memset(&engine,0,sizeof(engine)); memset(queues,0,sizeof(queues));
     memset(callbacks,0,sizeof(callbacks)); memset(errors,0,sizeof(errors));
     memset(submitted,0,sizeof(submitted)); memset(released,0,sizeof(released));
     memset(buffers,0,sizeof(buffers));
     submit_error=pack_error=0; poisoned=early_irq=false; unpack_count=0;
-    engine.workqueue=&queue;
+    for (unsigned i=0;i<4;i++) {
+        engine.slots[i].workqueue=&queues[i];
+        engine.slots[i].engine=&engine;
+        engine.slots[i].index=i;
+        INIT_WORK(&engine.slots[i].completions,airoha_completions);
+    }
     INIT_LIST_HEAD(&engine.pending);
-    INIT_WORK(&engine.completions,airoha_completions);
     INIT_WORK(&engine.watchdog.work,airoha_watchdog);
     engine.transport=(struct airoha_crypto_transport){
         .buffer=buffer_get,.submit=submit,.result=result,.release=release};
@@ -66,15 +81,49 @@ static void refuse(int expected,bool backlog) {
     r.base.flags=backlog ? CRYPTO_TFM_REQ_MAY_BACKLOG : 0;
     assert(airoha_enqueue(&r,false)==expected);
 }
-static void irq(void) { airoha_crypto_engine_notify(&engine); run_queue(&queue); }
+static void irq(void) { airoha_crypto_engine_notify(&engine, 15); run_all(); }
 static void watchdog(void) {
     assert(engine.watchdog.armed); engine.watchdog.armed=false;
-    engine.watchdog.work.fn(&engine.watchdog.work); run_queue(&queue);
+    engine.watchdog.work.fn(&engine.watchdog.work); run_all();
 }
 int main(void) {
+    /* A single completion schedules only its slot; repeated IRQs coalesce. */
     reset();
     for (unsigned i=0;i<4;i++) enqueue(i,false,false,1420);
-    run_queue(&queue);
+    run_all();
+    statuses[2]=1;
+    airoha_crypto_engine_notify(&engine, BIT(2));
+    airoha_crypto_engine_notify(&engine, BIT(2));
+    airoha_crypto_engine_notify(&engine, BIT(7));
+    for (unsigned i=0;i<4;i++) assert(queues[i].count==(i==2));
+    run_all();
+    assert(callbacks[2] && !callbacks[0] && !callbacks[1] && !callbacks[3]);
+    airoha_crypto_engine_notify(&engine, BIT(2));
+    assert(!queues[2].count); /* Ignore a stale notification for an idle slot. */
+    statuses[0]=statuses[1]=statuses[3]=1;
+    airoha_crypto_engine_notify(&engine, BIT(0)|BIT(1)|BIT(3));
+    run_all();
+    for (unsigned i=0;i<4;i++) assert(callbacks[i]==1);
+
+    /* Leave slot zero's submission queued: other slots must progress alone. */
+    reset();
+    for (unsigned i=0;i<4;i++) enqueue(i,false,false,1420);
+    for (unsigned i=1;i<4;i++) run_queue(&queues[i]);
+    assert(!submitted[0]);
+    airoha_crypto_engine_notify(&engine, 15);
+    for (unsigned i=1;i<4;i++) {
+        statuses[i]=1;
+        run_queue(&queues[i]);
+        assert(callbacks[i]==1);
+    }
+    assert(!callbacks[0] && queues[0].count);
+    early_irq=true;
+    run_all();
+    assert(callbacks[0]==1 && !engine.slots_in_use);
+
+    reset();
+    for (unsigned i=0;i<4;i++) enqueue(i,false,false,1420);
+    run_all();
     for (unsigned i=0;i<4;i++) {
         assert(submitted[i]==1 && engine.active[i] && !callbacks[i]);
         assert(buffers[i][0]==0x5a);
@@ -93,17 +142,17 @@ int main(void) {
     assert(unpack_count==5);
 
     reset(); early_irq=true;
-    enqueue(0,false,false,1420); run_queue(&queue);
+    enqueue(0,false,false,1420); run_all();
     assert(callbacks[0]==1 && !engine.slots_in_use);
 
-    reset(); enqueue(0,false,false,1420); engine.stopping=true; run_queue(&queue);
+    reset(); enqueue(0,false,false,1420); engine.stopping=true; run_all();
     statuses[0]=1; watchdog(); /* Complete with no IRQ. */
     assert(callbacks[0]==1);
 
     reset();
     for (unsigned i=0;i<4;i++) enqueue(i,false,false,1420);
     for (unsigned i=4;i<132;i++) enqueue(i,true,false,1420);
-    refuse(-EAGAIN,true); run_queue(&queue);
+    refuse(-EAGAIN,true); run_all();
     statuses[0]=-ETIMEDOUT; watchdog();
     for (unsigned i=0;i<132;i++) {
         assert(callbacks[i]==1);
@@ -115,7 +164,7 @@ int main(void) {
 
     reset();
     for (unsigned i=0;i<4;i++) enqueue(i,false,false,1420);
-    run_queue(&queue);
+    run_all();
     statuses[2]=-ETIMEDOUT; irq();
     assert(!callbacks[0] && !callbacks[1] && callbacks[2] && callbacks[3]);
     watchdog();
@@ -123,18 +172,18 @@ int main(void) {
     assert(!engine.slots_in_use && !unpack_count);
 
     reset(); pack_error=-EINVAL;
-    enqueue(0,false,false,1420); run_queue(&queue);
+    enqueue(0,false,false,1420); run_all();
     assert(callbacks[0]==1 && errors[0]==-EINVAL && released[0]==1);
     assert(!submitted[0] && !buffers[0][0]);
 
     reset(); submit_error=-EIO;
-    enqueue(0,false,false,1420); run_queue(&queue);
+    enqueue(0,false,false,1420); run_all();
     assert(callbacks[0]==1 && errors[0]==-EIO && released[0]==1);
     assert(!engine.active[0] && !buffers[0][0]);
 
-    reset(); enqueue(0,true,true,8); run_queue(&queue);
+    reset(); enqueue(0,true,true,8); run_all();
     assert(errors[0]==-EINVAL && !released[0]);
-    enqueue(1,true,false,17000); run_queue(&queue);
+    enqueue(1,true,false,17000); run_all();
     assert(errors[1]==-EMSGSIZE && !released[0]);
     engine.stopping=true; refuse(-EAGAIN,true);
 }

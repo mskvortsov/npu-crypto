@@ -42,11 +42,15 @@ workqueues.
 
 In normal mode, WireGuard does not request driver backlog, so a full NPU
 falls back to software. This bounds hardware work to the configured slot
-count and replaces the previous blocking integration. The driver packs and unpacks directly in persistent DMA slots, avoiding an
-intermediate request buffer and two full-request copies. An ordered worker
-queue submits requests and processes completions without sleeping for the NPU.
-Mailbox interrupts schedule completion processing; a shared watchdog detects
-timeouts and recovers missed interrupts. Hardware throughput and latency
+count and replaces the previous blocking integration. The driver packs and
+unpacks directly in persistent DMA slots, avoiding an intermediate request
+buffer and two full-request copies. Each slot has its own ordered worker queue,
+allowing packing and unpacking across slots to run in parallel.
+Submission and completion within a slot remain serialized, without sleeping
+for the NPU.
+Mailbox interrupts schedule completion processing only for submitted slots
+whose mailbox reports completion; idle and unfinished slots stay asleep.
+A shared watchdog detects timeouts and recovers missed interrupts. Hardware throughput and latency
 must be measured on the target. The libkcapi benchmark selects the NPU algorithm
 directly and bypasses WireGuard's packet processing.
 

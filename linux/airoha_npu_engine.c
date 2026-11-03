@@ -17,11 +17,18 @@
 #define AIROHA_CRYPTO_MAX_PENDING 128
 
 struct airoha_crypto_work;
+struct airoha_crypto_engine;
+
+struct airoha_crypto_slot {
+	struct workqueue_struct *workqueue;
+	struct work_struct completions;
+	struct airoha_crypto_engine *engine;
+	unsigned int index;
+};
 
 struct airoha_crypto_engine {
 	struct aead_alg alg;
-	struct workqueue_struct *workqueue;
-	struct work_struct completions;
+	struct airoha_crypto_slot slots[AIROHA_CRYPTO_NPU_BATCH_SIZE];
 	struct delayed_work watchdog;
 	struct airoha_crypto_work *active[AIROHA_CRYPTO_NPU_BATCH_SIZE];
 	struct airoha_crypto_transport transport;
@@ -137,6 +144,8 @@ static int airoha_reserve_slot(struct airoha_crypto_engine *e)
 		for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
 			if (!(old & BIT(slot)))
 				break;
+		if (slot == AIROHA_CRYPTO_NPU_BATCH_SIZE)
+			return -EBUSY;
 		new = old | (1 << slot);
 		if (atomic_cmpxchg(&e->slots_in_use, old, new) == old)
 			return slot;
@@ -194,7 +203,8 @@ static int airoha_enqueue(struct aead_request *req, bool decrypt)
 	job->slot = slot;
 	job->decrypt = decrypt;
 	INIT_WORK(&job->work, airoha_do_work);
-	if (unlikely(!queue_work(ctx->engine->workqueue, &job->work))) {
+	if (unlikely(!queue_work(ctx->engine->slots[slot].workqueue,
+				 &job->work))) {
 		atomic_andnot(BIT(slot), &ctx->engine->slots_in_use);
 		spin_unlock_irqrestore(&ctx->engine->lock, flags);
 		kfree(job);
@@ -215,7 +225,7 @@ static int airoha_decrypt(struct aead_request *req)
 	return airoha_enqueue(req, true);
 }
 
-/* Runs on the ordered engine queue after completion or transport failure. */
+/* Submission and completion are serialized within each slot only. */
 static void airoha_finish(struct airoha_crypto_engine *e,
 			  struct airoha_crypto_work *job, int err)
 {
@@ -230,7 +240,8 @@ static void airoha_finish(struct airoha_crypto_engine *e,
 		list_del_init(&next->pending);
 		e->pending_count--;
 		next->slot = job->slot;
-		WARN_ON_ONCE(!queue_work(e->workqueue, &next->work));
+		WARN_ON_ONCE(!queue_work(e->slots[job->slot].workqueue,
+					 &next->work));
 	} else {
 		atomic_andnot(BIT(job->slot), &e->slots_in_use);
 	}
@@ -284,9 +295,9 @@ static void airoha_do_work(struct work_struct *work)
 	job->length = len;
 	e->active[job->slot] = job;
 	/* Covers lost interrupts, timeout detection, and diagnostic polling.
-	 * IRQ and watchdog completion work cannot run until this worker returns.
+	 * The slot completion work cannot run until this worker returns.
 	 */
-	queue_delayed_work(e->workqueue, &e->watchdog, 1);
+	queue_delayed_work(e->slots[0].workqueue, &e->watchdog, 1);
 	return;
 release:
 	e->transport.release(e->transport.ctx, job->slot, capacity);
@@ -296,41 +307,41 @@ done:
 
 static void airoha_completions(struct work_struct *work)
 {
-	struct airoha_crypto_engine *e =
-		container_of(work, struct airoha_crypto_engine, completions);
-	unsigned int slot;
-	bool active = false;
+	struct airoha_crypto_slot *slot =
+		container_of(work, struct airoha_crypto_slot, completions);
+	struct airoha_crypto_engine *e = slot->engine;
+	struct airoha_crypto_work *job = e->active[slot->index];
+	struct airoha_crypto_request *buffer;
+	int status, err;
 
-	for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++) {
-		struct airoha_crypto_work *job = e->active[slot];
-		struct airoha_crypto_request *buffer;
-		int status, err;
-
-		if (!job)
-			continue;
-		status = e->transport.result(e->transport.ctx, slot);
-		if (status == -EINPROGRESS) {
-			active = true;
-			continue;
-		}
-		err = status;
-		if (status >= 0) {
-			buffer = e->transport.buffer(e->transport.ctx, slot);
-			err = buffer ? airoha_crypto_unpack(buffer, job->length,
-							    job->req->dst,
-							    status) :
-				       -ENODEV;
-		}
-		e->transport.release(e->transport.ctx, slot, job->length);
-		airoha_finish(e, job, err);
+	if (!job)
+		return;
+	status = e->transport.result(e->transport.ctx, slot->index);
+	if (status == -EINPROGRESS) {
+		queue_delayed_work(e->slots[0].workqueue, &e->watchdog, 1);
+		return;
 	}
-	if (active)
-		queue_delayed_work(e->workqueue, &e->watchdog, 1);
+	err = status;
+	if (status >= 0) {
+		buffer = e->transport.buffer(e->transport.ctx, slot->index);
+		err = buffer ? airoha_crypto_unpack(buffer, job->length,
+						    job->req->dst, status) :
+			       -ENODEV;
+	}
+	e->transport.release(e->transport.ctx, slot->index, job->length);
+	airoha_finish(e, job, err);
 }
 
-void airoha_crypto_engine_notify(struct airoha_crypto_engine *e)
+void airoha_crypto_engine_notify(struct airoha_crypto_engine *e,
+				 unsigned int slots)
 {
-	queue_work(e->workqueue, &e->completions);
+	unsigned int slot;
+
+	slots &= atomic_read(&e->slots_in_use);
+	for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
+		if (slots & BIT(slot))
+			queue_work(e->slots[slot].workqueue,
+				   &e->slots[slot].completions);
 }
 
 static void airoha_watchdog(struct work_struct *work)
@@ -338,7 +349,7 @@ static void airoha_watchdog(struct work_struct *work)
 	struct airoha_crypto_engine *e = container_of(
 		to_delayed_work(work), struct airoha_crypto_engine, watchdog);
 
-	airoha_crypto_engine_notify(e);
+	airoha_crypto_engine_notify(e, atomic_read(&e->slots_in_use));
 }
 
 struct airoha_crypto_engine *
@@ -347,6 +358,7 @@ airoha_crypto_engine_register(struct device *dev,
 {
 	struct airoha_crypto_engine *e;
 	int ret;
+	unsigned int slot;
 
 	if (!transport || !transport->buffer || !transport->submit ||
 	    !transport->result || !transport->stop || !transport->release)
@@ -378,21 +390,25 @@ airoha_crypto_engine_register(struct device *dev,
 	e->alg.base.cra_blocksize = 1;
 	e->alg.base.cra_ctxsize = sizeof(struct airoha_crypto_ctx);
 	e->alg.base.cra_module = THIS_MODULE;
-	INIT_WORK(&e->completions, airoha_completions);
 	INIT_DELAYED_WORK(&e->watchdog, airoha_watchdog);
-	e->workqueue =
-		alloc_ordered_workqueue("airoha-npu-crypto", WQ_MEM_RECLAIM);
-	if (!e->workqueue) {
-		ret = -ENOMEM;
-		goto free;
+	for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++) {
+		e->slots[slot].engine = e;
+		e->slots[slot].index = slot;
+		INIT_WORK(&e->slots[slot].completions, airoha_completions);
+		e->slots[slot].workqueue = alloc_ordered_workqueue(
+			"airoha-npu-crypto-%u", WQ_MEM_RECLAIM, slot);
+		if (!e->slots[slot].workqueue) {
+			ret = -ENOMEM;
+			goto destroy_workqueue;
+		}
 	}
 	ret = crypto_register_aead(&e->alg);
 	if (ret)
 		goto destroy_workqueue;
 	return e;
 destroy_workqueue:
-	destroy_workqueue(e->workqueue);
-free:
+	while (slot)
+		destroy_workqueue(e->slots[--slot].workqueue);
 	kfree(e);
 	return ERR_PTR(ret);
 }
@@ -400,6 +416,7 @@ free:
 void airoha_crypto_engine_unregister(struct airoha_crypto_engine *e)
 {
 	unsigned long flags;
+	unsigned int slot;
 
 	spin_lock_irqsave(&e->lock, flags);
 	e->stopping = true;
@@ -413,7 +430,8 @@ void airoha_crypto_engine_unregister(struct airoha_crypto_engine *e)
 	wait_for_completion(&e->released);
 	e->transport.stop(e->transport.ctx);
 	cancel_delayed_work_sync(&e->watchdog);
-	destroy_workqueue(e->workqueue);
+	for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
+		destroy_workqueue(e->slots[slot].workqueue);
 	kfree(e);
 }
 

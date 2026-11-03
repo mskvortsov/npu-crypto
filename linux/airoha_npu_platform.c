@@ -87,6 +87,7 @@ struct airoha_crypto_dev {
 	struct dentry *profile_dir;
 	wait_queue_head_t completion_wait;
 	atomic_t irq_count;
+	atomic_t pending_slots;
 };
 
 static irqreturn_t airoha_crypto_irq(int irq, void *data)
@@ -94,6 +95,7 @@ static irqreturn_t airoha_crypto_irq(int irq, void *data)
 	struct airoha_crypto_dev *npu = data;
 	struct airoha_crypto_engine *engine;
 	u32 ctrl;
+	unsigned int slot, pending, done = 0;
 
 	if (!(readl(npu->regs + NPU_MBOX_INT_STATUS) & NPU_MBOX_HOST_BIT))
 		return IRQ_NONE;
@@ -108,10 +110,22 @@ static irqreturn_t airoha_crypto_irq(int irq, void *data)
 	/* Kernel barrier macros intentionally accept a pointer-to-pointer. */
 	// NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion,bugprone-switch-missing-default-case)
 	engine = smp_load_acquire(&npu->engine);
-	if (engine)
-		airoha_crypto_engine_notify(engine);
-	else
+	if (engine) {
+		/* Completed mailbox statuses persist after a slot is released.
+		 * Inspect only submitted slots, and leave pending ones asleep.
+		 */
+		pending = atomic_read(&npu->pending_slots);
+		for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
+			if ((pending & BIT(slot)) &&
+			    (readl(npu->regs +
+				   NPU_MBOX_CTRL3(
+					   AIROHA_CRYPTO_NPU_QUEUE(slot))) &
+			     NPU_DONE))
+				done |= BIT(slot);
+		airoha_crypto_engine_notify(engine, done);
+	} else {
 		wake_up(&npu->completion_wait);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -223,6 +237,10 @@ static int airoha_crypto_submit(void *context, unsigned int slot, size_t len)
 	writel(NPU_WAIT | (state->profile ? AIROHA_PROFILE_FLAG : 0) |
 		       (state->interrupt ? AIROHA_INTERRUPT_FLAG : 0),
 	       npu->regs + NPU_MBOX_CTRL3(queue));
+	/* Publish after clearing the previous DONE and before ringing the
+	 * doorbell, so even a completion before submit returns is noticed.
+	 */
+	atomic_or(BIT(slot), &npu->pending_slots);
 	seq = readl(npu->regs + NPU_MBOX_CTRL2(queue));
 	writel(seq + 1, npu->regs + NPU_MBOX_CTRL2(queue));
 	state->submitted = state->profile ? ktime_get_ns() : 0;
@@ -246,14 +264,19 @@ static int airoha_crypto_result(void *context, unsigned int slot)
 	u64 completed;
 	u32 ctrl;
 
-	if (READ_ONCE(npu->poisoned))
+	if (READ_ONCE(npu->poisoned)) {
+		atomic_andnot(BIT(slot), &npu->pending_slots);
 		return -ENODEV;
+	}
 	ctrl = readl(npu->regs + NPU_MBOX_CTRL3(AIROHA_CRYPTO_NPU_QUEUE(slot)));
 	if (!(ctrl & NPU_DONE)) {
-		if (time_after_eq(jiffies, state->deadline))
+		if (time_after_eq(jiffies, state->deadline)) {
+			atomic_andnot(BIT(slot), &npu->pending_slots);
 			return airoha_crypto_timeout(npu);
+		}
 		return -EINPROGRESS;
 	}
+	atomic_andnot(BIT(slot), &npu->pending_slots);
 	completed = profile ? ktime_get_ns() : 0;
 	dma_rmb();
 	if (profile) {
@@ -497,6 +520,7 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	if (!npu)
 		return -ENOMEM;
 	npu->dev = dev;
+	atomic_set(&npu->pending_slots, 0);
 	spin_lock_init(&npu->profile_lock);
 	init_waitqueue_head(&npu->completion_wait);
 	npu->regs = devm_platform_ioremap_resource(pdev, 0);
