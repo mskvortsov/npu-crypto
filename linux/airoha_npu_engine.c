@@ -235,9 +235,10 @@ static void airoha_do_work(struct work_struct *work)
 		goto done;
 	}
 	capacity = sizeof(*buffer) + req->assoclen + data_len;
-	buffer = kmalloc(capacity, GFP_KERNEL);
+	buffer = ctx->engine->transport.buffer(ctx->engine->transport.ctx,
+					       job->slot);
 	if (!buffer) {
-		err = -ENOMEM;
+		err = -ENODEV;
 		goto done;
 	}
 	len = airoha_crypto_pack(buffer, capacity, req->src, req->assoclen,
@@ -245,17 +246,18 @@ static void airoha_do_work(struct work_struct *work)
 				 job->decrypt);
 	if (len < 0) {
 		err = len;
-		goto free;
+		goto release;
 	}
 	status = ctx->engine->transport.transfer(ctx->engine->transport.ctx,
-						 job->slot, buffer, len);
+						 job->slot, len);
 	if (status < 0) {
 		err = status;
-		goto free;
+		goto release;
 	}
 	err = airoha_crypto_unpack(buffer, len, req->dst, status);
-free:
-	kfree_sensitive(buffer);
+release:
+	ctx->engine->transport.release(ctx->engine->transport.ctx, job->slot,
+				       capacity);
 done: {
 	struct airoha_crypto_work *next = NULL;
 	unsigned long flags;
@@ -284,7 +286,8 @@ airoha_crypto_engine_register(struct device *dev,
 	struct airoha_crypto_engine *e;
 	int ret;
 
-	if (!transport || !transport->transfer)
+	if (!transport || !transport->buffer || !transport->transfer ||
+	    !transport->release)
 		return ERR_PTR(-EINVAL);
 	(void)dev;
 	e = kzalloc(sizeof(*e), GFP_KERNEL);

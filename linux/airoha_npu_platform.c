@@ -157,9 +157,27 @@ static bool airoha_crypto_has_network_consumer(struct device_node *target)
 	return false;
 }
 
-/* The engine serializes calls; the coherent bounce buffer belongs to us. */
-static int airoha_crypto_transfer(void *context, unsigned int slot,
-				  void *request, size_t len)
+/* The engine reserves each slot until unpacking and clearing have finished. */
+static void *airoha_crypto_buffer(void *context, unsigned int slot)
+{
+	struct airoha_crypto_dev *npu = context;
+
+	if (slot >= AIROHA_CRYPTO_NPU_BATCH_SIZE || READ_ONCE(npu->poisoned))
+		return NULL;
+	return npu->bounce + (size_t)slot * NPU_DMA_SLOT_SIZE;
+}
+
+static void airoha_crypto_release(void *context, unsigned int slot, size_t len)
+{
+	struct airoha_crypto_dev *npu = context;
+
+	/* After a timeout firmware may still be reading or writing this slot. */
+	if (!READ_ONCE(npu->poisoned))
+		memzero_explicit(npu->bounce + (size_t)slot * NPU_DMA_SLOT_SIZE,
+				 len);
+}
+
+static int airoha_crypto_transfer(void *context, unsigned int slot, size_t len)
 {
 	struct airoha_crypto_dev *npu = context;
 	void *bounce;
@@ -169,7 +187,7 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 	bool profile = READ_ONCE(npu_profile);
 	bool use_irq = READ_ONCE(npu_interrupt);
 	u64 started = profile ? ktime_get_ns() : 0;
-	u64 t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
+	u64 t1 = 0, t2 = 0, t3 = 0;
 	int ret;
 
 	if (READ_ONCE(npu->poisoned))
@@ -183,9 +201,6 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 		profile = false;
 	bounce = npu->bounce + (size_t)slot * NPU_DMA_SLOT_SIZE;
 	dma = npu->dma + (size_t)slot * NPU_DMA_SLOT_SIZE;
-	if (profile)
-		t0 = ktime_get_ns();
-	memcpy(bounce, request, len);
 	if (profile)
 		t1 = ktime_get_ns();
 	dma_wmb();
@@ -222,12 +237,6 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 	if (profile)
 		t3 = ktime_get_ns();
 	dma_rmb();
-	memcpy(request, bounce, len);
-	if (profile)
-		t4 = ktime_get_ns();
-	memzero_explicit(bounce, len);
-	if (profile)
-		t5 = ktime_get_ns();
 	if (profile) {
 		struct airoha_profile_sample sample;
 		struct airoha_profile_aggregate *agg = &npu->profile[slot];
@@ -246,11 +255,11 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 		agg->host_##name##_ns_max =                 \
 			max(agg->host_##name##_ns_max, ns); \
 	} while (0)
-		HOST_ACCUMULATE(copy_in, t1 - t0);
+		HOST_ACCUMULATE(copy_in, 0);
 		HOST_ACCUMULATE(submit, t2 - t1);
 		HOST_ACCUMULATE(poll, t3 - t2);
-		HOST_ACCUMULATE(copy_out, t4 - t3);
-		HOST_ACCUMULATE(clear, t5 - t4);
+		HOST_ACCUMULATE(copy_out, 0);
+		HOST_ACCUMULATE(clear, 0);
 #undef HOST_ACCUMULATE
 #define PROFILE_ACCUMULATE(name)                                            \
 	do {                                                                \
@@ -275,10 +284,10 @@ static int airoha_crypto_selftest(struct airoha_crypto_dev *npu)
 	unsigned int slot, i;
 	int status, ret = 0;
 
-	req = kzalloc(len, GFP_KERNEL);
-	if (!req)
-		return -ENOMEM;
 	for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++) {
+		req = airoha_crypto_buffer(npu, slot);
+		if (!req)
+			return -ENODEV;
 		memset(req, 0, len);
 		req->version = cpu_to_le32(AIROHA_CRYPTO_VERSION);
 		req->length = cpu_to_le32(data_len);
@@ -291,7 +300,7 @@ static int airoha_crypto_selftest(struct airoha_crypto_dev *npu)
 			req->data[i] = 255 - i;
 		for (i = 0; i < data_len; i++)
 			req->data[aad_len + i] = i;
-		status = airoha_crypto_transfer(npu, slot, req, len);
+		status = airoha_crypto_transfer(npu, slot, len);
 		if (status != 1) {
 			dev_err(npu->dev,
 				"selftest slot %u encrypt status %d\n", slot,
@@ -316,7 +325,7 @@ static int airoha_crypto_selftest(struct airoha_crypto_dev *npu)
 			goto next;
 		}
 		req->operation = cpu_to_le32(1);
-		status = airoha_crypto_transfer(npu, slot, req, len);
+		status = airoha_crypto_transfer(npu, slot, len);
 		if (status != 1) {
 			dev_err(npu->dev,
 				"selftest slot %u decrypt status %d\n", slot,
@@ -334,6 +343,7 @@ static int airoha_crypto_selftest(struct airoha_crypto_dev *npu)
 			}
 		dev_info(npu->dev, "selftest slot %u passed\n", slot);
 next:
+		airoha_crypto_release(npu, slot, len);
 		if (READ_ONCE(npu->poisoned))
 			break;
 	}
@@ -347,7 +357,6 @@ next:
 		WRITE_ONCE(npu->poisoned, true);
 		ret = -ETIMEDOUT;
 	}
-	kfree_sensitive(req);
 	return ret;
 }
 
@@ -461,7 +470,9 @@ static int airoha_crypto_probe(struct platform_device *pdev)
 	ret = airoha_crypto_selftest(npu);
 	if (ret)
 		goto free_dma;
+	transport.buffer = airoha_crypto_buffer;
 	transport.transfer = airoha_crypto_transfer;
+	transport.release = airoha_crypto_release;
 	transport.ctx = npu;
 	npu->engine = airoha_crypto_engine_register(dev, &transport);
 	if (IS_ERR(npu->engine)) {

@@ -7,10 +7,14 @@
 struct device;
 struct airoha_crypto_engine;
 
-/* transfer must return only after releasing all access to request. */
+/* The engine owns a slot exclusively from buffer() through release().
+ * transfer() returns after DMA completes, or quarantines the buffer on error.
+ * release() clears the used bytes unless the transport is quarantined.
+ */
 struct airoha_crypto_transport {
-	int (*transfer)(void *ctx, unsigned int slot, void *request,
-			size_t length);
+	void *(*buffer)(void *ctx, unsigned int slot);
+	int (*transfer)(void *ctx, unsigned int slot, size_t length);
+	void (*release)(void *ctx, unsigned int slot, size_t length);
 	void *ctx;
 };
 
