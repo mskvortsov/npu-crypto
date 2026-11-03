@@ -1,6 +1,4 @@
 # Firmware runs bare-metal on the AN7581 RV32 NPU.
-If:
-  PathMatch: npu/.*\.(c|h)
 CompileFlags:
   Compiler: clang
   Add:
