@@ -57,6 +57,26 @@ static void wait_done(u32 group)
  }
  finish(0x13333);
 }
+static void reject_profile(u32 base, u32 length, u32 flags)
+{
+ u32 q = AIROHA_CRYPTO_NPU_QUEUE(0), count;
+ volatile u32 *sample = (volatile u32 *)((u8 *)&requests[0] + AIROHA_PROFILE_OFFSET);
+ *sample = 0x12345678;
+ REG32(MBQ_CTRL0(q)) = base;
+ REG32(MBQ_CTRL1(q)) = length;
+ REG32(MBQ_CTRL3(q)) = flags | AIROHA_PROFILE_FLAG;
+ fence();
+ REG32(MBQ_CTRL2(q)) = REG32(MBQ_CTRL2(q)) + 1;
+ for (count = 0; count < 200000000; count++) {
+  u32 ctrl = REG32(MBQ_CTRL3(q));
+  if (ctrl & 2) {
+   fence();
+   if (((ctrl >> 2) & 7) || *sample != 0x12345678) finish(0x13333);
+   return;
+  }
+ }
+ finish(0x13333);
+}
 void mailbox_test_main(void)
 {
  u32 count, g, i, round;
@@ -90,5 +110,10 @@ void mailbox_test_main(void)
   if (count == 200000000) finish(0x13333);
   service_notification();
  }
+ reject_profile((u32)&requests[0], 76, 0); /* Invalid command, valid destination. */
+ reject_profile((u32)&requests[0] + 1, 76, 1);
+ reject_profile(0x3ffffff0, 76, 1); /* Request crosses window. */
+ reject_profile(0x3fff1000, 76, 1); /* Only trailer crosses window. */
+ reject_profile((u32)&requests[0], AIROHA_PROFILE_OFFSET + 1, 1);
  finish(0x5555);
 }

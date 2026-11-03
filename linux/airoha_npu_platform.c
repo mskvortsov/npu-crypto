@@ -164,8 +164,9 @@ static int airoha_crypto_transfer(void *context, unsigned int slot,
 		return -EINVAL;
 	if (len > AIROHA_CRYPTO_MAX_REQUEST)
 		return -EMSGSIZE;
-	if (profile && len > AIROHA_PROFILE_OFFSET)
-		return -EMSGSIZE;
+	/* Large requests use the trailer space; collect no sample for them. */
+	if (len > AIROHA_PROFILE_OFFSET)
+		profile = false;
 	bounce = npu->bounce + slot * NPU_DMA_SLOT_SIZE;
 	dma = npu->dma + slot * NPU_DMA_SLOT_SIZE;
 	if (profile) t0 = ktime_get_ns();

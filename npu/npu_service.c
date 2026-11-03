@@ -10,6 +10,16 @@
 #define WORKERS_START 0x43525731
 #define CRYPTO_READY 0x43525931
 
+/* CTRL3 command validation checks bit 0, bit 5 and bits 14:11.
+ * Completion/status and optional profiling/interrupt bits are excluded. */
+#define CRYPTO_COMMAND_MASK 0x7821u
+#define CRYPTO_COMMAND_REQUEST 1u
+#define CRYPTO_DMA_ALIGNMENT 4u
+/* Host addresses select an offset in a 1 GiB uncached NPU window. */
+#define CRYPTO_DMA_WINDOW_SIZE 0x40000000u
+#define CRYPTO_DMA_OFFSET_MASK (CRYPTO_DMA_WINDOW_SIZE - 1)
+#define CRYPTO_DMA_WINDOW_BASE 0x40000000u
+
 #if defined(NPU_CRYPTO_TEST) && !defined(NPU_CRYPTO_QEMU)
 static void parallel_xor(u8 *d, const u8 *s, u32 len, const u8 k[32], const u8 iv[12])
 {
@@ -251,8 +261,10 @@ static int crypto_request(u32 g, u32 base, u32 len)
 #ifdef NPU_CRYPTO_QEMU_MAILBOX
 	return process_request(g, (void *)base, len);
 #else
-	if ((base & 3) || len > 0x40000000 - (base & 0x3fffffff)) return 0;
-	return process_request(g, (void *)((base & 0x3fffffff) | 0x40000000), len);
+	if ((base & (CRYPTO_DMA_ALIGNMENT - 1)) ||
+	    len > CRYPTO_DMA_WINDOW_SIZE - (base & CRYPTO_DMA_OFFSET_MASK)) return 0;
+	return process_request(g, (void *)((base & CRYPTO_DMA_OFFSET_MASK) |
+					 CRYPTO_DMA_WINDOW_BASE), len);
 #endif
 }
 
@@ -312,29 +324,39 @@ static void __attribute__((noreturn)) service_group(u32 g)
 	fence_all();
 	REG32(NPU_MIB31) = CRYPTO_READY;
 	for (;;) {
-		u32 now = REG32(MBQ_CTRL2(queue)), arg, ret, base, t = 0, i;
+		u32 now = REG32(MBQ_CTRL2(queue)), arg, ret, base, len, valid, t = 0, i;
 		if (now == seq) continue;
 		seq = now;
 		__asm__ volatile("fence iorw, iorw" ::: "memory");
 		arg = REG32(MBQ_CTRL3(queue)); ret = 0;
 		base = REG32(MBQ_CTRL0(queue));
+		len = REG32(MBQ_CTRL1(queue)) & 0xffff;
+		valid = (arg & CRYPTO_COMMAND_MASK) == CRYPTO_COMMAND_REQUEST &&
+			!(base & (CRYPTO_DMA_ALIGNMENT - 1)) &&
+			len <= CRYPTO_DMA_WINDOW_SIZE - (base & CRYPTO_DMA_OFFSET_MASK);
 		group[g].profiling = !!(arg & AIROHA_PROFILE_FLAG);
+		/* Validate the complete trailer before any profiled DMA access. */
+		if (group[g].profiling &&
+		    (len > AIROHA_PROFILE_OFFSET ||
+		     AIROHA_PROFILE_OFFSET + sizeof(group[g].sample) >
+		     CRYPTO_DMA_WINDOW_SIZE - (base & CRYPTO_DMA_OFFSET_MASK)))
+			valid = 0;
 		if (group[g].profiling) {
 			u32 *p = (u32 *)&group[g].sample;
 			for (i = 0; i < sizeof(group[g].sample) / 4; i++) p[i] = 0;
 			t = csr_read(mcycle);
 		}
-		if ((arg & 0x7821) == 1 &&
-		    (!group[g].profiling || (REG32(MBQ_CTRL1(queue)) & 0xffff) <= AIROHA_PROFILE_OFFSET))
-			ret = crypto_request(g, base, REG32(MBQ_CTRL1(queue)) & 0xffff);
-		if (group[g].profiling && (REG32(MBQ_CTRL1(queue)) & 0xffff) <= AIROHA_PROFILE_OFFSET) {
+		if (valid)
+			ret = crypto_request(g, base, len);
+		if (valid && group[g].profiling) {
 			volatile u32 *dst;
 			u32 *src = (u32 *)&group[g].sample;
 			group[g].sample.total = (u32)csr_read(mcycle) - t;
 #ifdef NPU_CRYPTO_QEMU_MAILBOX
 			dst = (volatile u32 *)(base + AIROHA_PROFILE_OFFSET);
 #else
-			dst = (volatile u32 *)(((base & 0x3fffffff) | 0x40000000) + AIROHA_PROFILE_OFFSET);
+			dst = (volatile u32 *)(((base & CRYPTO_DMA_OFFSET_MASK) |
+				CRYPTO_DMA_WINDOW_BASE) + AIROHA_PROFILE_OFFSET);
 #endif
 			for (i = 0; i < sizeof(group[g].sample) / 4; i++) dst[i] = src[i];
 		}
