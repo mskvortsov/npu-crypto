@@ -20,10 +20,19 @@ Run `make format-check` to check formatting of firmware and Linux module C sourc
 
 Run `make tidy` for both components, or `make tidy-linux` for the Linux module alone. Linux checks use clang-tidy 21 against a configured and built ARM64 kernel for all four batch sizes. `linux/tooling.mk` discovers the kernel under `OPENWRT_DIR` (default `/w/openwrt-nokia`); set `KERNEL_DIR=/path/to/linux` to select it explicitly. The flags mirror `linux/.clangd`; `linux/.clang-tidy` documents kernel-specific exclusions. Only module sources and project headers produce diagnostics; upstream kernel headers are excluded. No module is installed or loaded by these targets.
 
-Run `make test` for the host and QEMU tests. These need a C compiler, OpenSSL development headers and library, Python with `cryptography`, the RV32 toolchain, and `qemu-system-riscv32`. The QEMU crypto tests use eight emulated harts; mailbox tests use a ninth hart to simulate the host.
+Run `make test` for the host, WireGuard dispatch concurrency, and QEMU tests. These need a C compiler, OpenSSL development headers and library, Python with `cryptography`, the RV32 toolchain, and `qemu-system-riscv32`. The QEMU crypto tests use eight emulated harts; mailbox tests use a ninth hart to simulate the host.
 
 Run `./deploy.sh` to build the firmware and Linux module using the configured OpenWrt tree and install them on `yasnogor`. It does not reboot the target; see `openwrt/README.md` for configuration options.
 
 The Linux module is built against the target kernel by the OpenWrt package. See `openwrt/README.md` for source synchronization and target integration. This directory is the source of truth; the OpenWrt package contains a separate snapshot that must be refreshed after edits.
 
 Basic firmware and WireGuard traffic have been exercised on the Nokia XG-040G-MD UBI target. A safe way to stop the NPU and reload firmware while running has not been established; changes to the loaded firmware or driver require a reboot. The WireGuard patch does not cover AmneziaWG.
+
+Build a standalone libkcapi throughput benchmark for the OpenWrt device with
+`make benchmark`. See [benchmark instructions](tools/README.md) for kernel
+prerequisites, concurrency options and software comparisons.
+
+WireGuard's software-first policy measures concurrent crypto calls, not CPU
+utilization. Software requests release their slot as soon as the synchronous
+call finishes, so NPU use depends on overlap between workers. The libkcapi
+benchmark selects the NPU algorithm directly and bypasses this WireGuard policy.

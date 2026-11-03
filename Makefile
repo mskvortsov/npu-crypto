@@ -28,3 +28,7 @@ test:
 	python3 tests/test_crypto_scratch.py
 	python3 tests/test_poly_parallel.py
 	sh tests/test_crypto_qemu.sh
+
+.PHONY: benchmark
+benchmark:
+	./tools/build-kcapi-bench.sh

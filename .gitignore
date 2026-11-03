@@ -9,3 +9,4 @@ __pycache__/
 /linux/Module.symvers
 /linux/modules.order
 /openwrt/package/kernel/airoha-npu-crypto
+/openwrt/target/linux/airoha/patches-6.18/932-wireguard-add-airoha-npu-offload.patch
