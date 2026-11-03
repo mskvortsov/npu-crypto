@@ -26,8 +26,7 @@ int airoha_crypto_pack(struct airoha_crypto_request *out, size_t capacity,
 		       struct scatterlist *src, unsigned int aad_len,
 		       unsigned int crypt_len, const u8 key[32],
 		       const u8 nonce[12], bool decrypt);
-int airoha_crypto_unpack(struct airoha_crypto_request *in,
-			 size_t capacity, struct scatterlist *dst,
-			 unsigned int status);
+int airoha_crypto_unpack(struct airoha_crypto_request *in, size_t capacity,
+			 struct scatterlist *dst, unsigned int status);
 
 #endif

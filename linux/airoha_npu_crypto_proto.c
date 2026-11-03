@@ -39,16 +39,16 @@ int airoha_crypto_pack(struct airoha_crypto_request *out, size_t capacity,
 	if (payload_len && sg_pcopy_to_buffer(src, nents, out->data,
 					      payload_len, 0) != payload_len)
 		return -EINVAL;
-	if (decrypt && sg_pcopy_to_buffer(src, nents, out->tag,
-					 AIROHA_CRYPTO_TAG_SIZE, payload_len) !=
-		       AIROHA_CRYPTO_TAG_SIZE)
+	if (decrypt &&
+	    sg_pcopy_to_buffer(src, nents, out->tag, AIROHA_CRYPTO_TAG_SIZE,
+			       payload_len) != AIROHA_CRYPTO_TAG_SIZE)
 		return -EINVAL;
-	return sizeof(*out) + payload_len;
+	/* The request-size checks above bound this result to 65535. */
+	return (int)(sizeof(*out) + payload_len);
 }
 
-int airoha_crypto_unpack(struct airoha_crypto_request *in,
-			 size_t capacity, struct scatterlist *dst,
-			 unsigned int status)
+int airoha_crypto_unpack(struct airoha_crypto_request *in, size_t capacity,
+			 struct scatterlist *dst, unsigned int status)
 {
 	unsigned int data_len = le32_to_cpu(in->length);
 	unsigned int aad_len = le32_to_cpu(in->aad_length);
@@ -71,9 +71,9 @@ int airoha_crypto_unpack(struct airoha_crypto_request *in,
 	if (payload_len && sg_pcopy_from_buffer(dst, nents, in->data,
 						payload_len, 0) != payload_len)
 		return -EINVAL;
-	if (!op && sg_pcopy_from_buffer(dst, nents, in->tag,
-					AIROHA_CRYPTO_TAG_SIZE, payload_len) !=
-		   AIROHA_CRYPTO_TAG_SIZE)
+	if (!op &&
+	    sg_pcopy_from_buffer(dst, nents, in->tag, AIROHA_CRYPTO_TAG_SIZE,
+				 payload_len) != AIROHA_CRYPTO_TAG_SIZE)
 		return -EINVAL;
 	return 0;
 }

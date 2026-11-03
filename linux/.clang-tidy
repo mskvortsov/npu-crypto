@@ -1,0 +1,16 @@
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-reserved-identifier,
+  -performance-no-int-to-ptr,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+# Crypto interfaces have adjacent byte arrays. Kernel wait/module macros use
+# assignments in conditions, reserved identifiers, and integer-to-pointer casts.
+# The kernel provides memcpy/memset, not the C11 Annex K alternatives.
+HeaderFilterRegex: '.*/(linux/airoha_npu_[^/]*|npu/npu_crypto_(config|profile))\.h$'
+WarningsAsErrors: '*'

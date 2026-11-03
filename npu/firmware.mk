@@ -1,4 +1,5 @@
 CROSS ?= riscv64-unknown-elf-
+CLANG_TIDY ?= clang-tidy-21
 CC := $(CROSS)gcc
 LD := $(CROSS)ld
 OBJCOPY := $(CROSS)objcopy
@@ -9,8 +10,16 @@ CFLAGS := $(ARCH) -Os -ffreestanding -fno-builtin -ffunction-sections \
 LIBGCC := $(shell $(CC) $(ARCH) -print-libgcc-file-name)
 OBJS := $(BUILD)/start.o $(BUILD)/service.o $(BUILD)/crypto.o $(BUILD)/chacha.o $(BUILD)/poly1305.o
 
-.PHONY: all
+.PHONY: all tidy
 all: $(BUILD)/npu_rv32.bin $(BUILD)/npu_data.bin
+
+# Check every supported packet/hart split using the production target flags.
+tidy:
+	@set -e; for batch in 1 2 4 8; do \
+		$(CLANG_TIDY) npu/npu_crypto.c npu/npu_service.c -- \
+			--target=riscv32-unknown-elf $(CFLAGS) \
+			-DAIROHA_CRYPTO_NPU_BATCH_SIZE=$$batch; \
+	done
 
 $(BUILD):
 	mkdir -p $@

@@ -35,11 +35,13 @@ static bool npu_enable = true;
 static bool npu_fallback = true;
 
 module_param(npu_enable, bool, 0644);
-MODULE_PARM_DESC(npu_enable,
-		 "Enable NPU offload above the minimum payload size (default: true)");
+MODULE_PARM_DESC(
+	npu_enable,
+	"Enable NPU offload above the minimum payload size (default: true)");
 module_param(npu_fallback, bool, 0644);
-MODULE_PARM_DESC(npu_fallback,
-		 "Use software/NEON fallback when all NPU packet slots are busy (default: true)");
+MODULE_PARM_DESC(
+	npu_fallback,
+	"Use software/NEON fallback when all NPU packet slots are busy (default: true)");
 
 static int airoha_counter_get(char *buffer, const struct kernel_param *param)
 {
@@ -134,7 +136,7 @@ static int airoha_reserve_slot(struct airoha_crypto_engine *e)
 		for (slot = 0; slot < AIROHA_CRYPTO_NPU_BATCH_SIZE; slot++)
 			if (!(old & BIT(slot)))
 				break;
-		new = old | BIT(slot);
+		new = old | (1 << slot);
 		if (atomic_cmpxchg(&e->slots_in_use, old, new) == old)
 			return slot;
 	}
@@ -142,7 +144,8 @@ static int airoha_reserve_slot(struct airoha_crypto_engine *e)
 
 static int airoha_enqueue(struct aead_request *req, bool decrypt)
 {
-	struct airoha_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct airoha_crypto_ctx *ctx =
+		crypto_aead_ctx(crypto_aead_reqtfm(req));
 	struct airoha_crypto_work *job;
 	u32 data_len = req->cryptlen;
 	unsigned long flags;
@@ -212,11 +215,11 @@ static int airoha_decrypt(struct aead_request *req)
 
 static void airoha_do_work(struct work_struct *work)
 {
-	struct airoha_crypto_work *job = container_of(work,
-								struct airoha_crypto_work,
-								work);
+	struct airoha_crypto_work *job =
+		container_of(work, struct airoha_crypto_work, work);
 	struct aead_request *req = job->req;
-	struct airoha_crypto_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
+	struct airoha_crypto_ctx *ctx =
+		crypto_aead_ctx(crypto_aead_reqtfm(req));
 	struct airoha_crypto_request *buffer;
 	u32 data_len = req->cryptlen;
 	size_t capacity;
@@ -230,7 +233,8 @@ static void airoha_do_work(struct work_struct *work)
 		data_len -= AIROHA_CRYPTO_TAG_SIZE;
 	}
 	if (data_len > AIROHA_CRYPTO_MAX_DATA ||
-	    req->assoclen > AIROHA_CRYPTO_MAX_REQUEST - sizeof(*buffer) - data_len) {
+	    req->assoclen >
+		    AIROHA_CRYPTO_MAX_REQUEST - sizeof(*buffer) - data_len) {
 		err = -EMSGSIZE;
 		goto done;
 	}
@@ -240,9 +244,9 @@ static void airoha_do_work(struct work_struct *work)
 		err = -ENOMEM;
 		goto done;
 	}
-	len = airoha_crypto_pack(buffer, capacity, req->src,
-				req->assoclen, req->cryptlen, ctx->key,
-				req->iv, job->decrypt);
+	len = airoha_crypto_pack(buffer, capacity, req->src, req->assoclen,
+				 req->cryptlen, ctx->key, req->iv,
+				 job->decrypt);
 	if (len < 0) {
 		err = len;
 		goto free;
@@ -256,24 +260,23 @@ static void airoha_do_work(struct work_struct *work)
 	err = airoha_crypto_unpack(buffer, len, req->dst, status);
 free:
 	kfree_sensitive(buffer);
-done:
-	{
-		struct airoha_crypto_work *next = NULL;
-		unsigned long flags;
+done: {
+	struct airoha_crypto_work *next = NULL;
+	unsigned long flags;
 
-		spin_lock_irqsave(&ctx->engine->lock, flags);
-		if (!list_empty(&ctx->engine->pending)) {
-			next = list_first_entry(&ctx->engine->pending,
-						struct airoha_crypto_work, pending);
-			list_del_init(&next->pending);
-			ctx->engine->pending_count--;
-			next->slot = job->slot;
-			WARN_ON_ONCE(!queue_work(ctx->engine->workqueue, &next->work));
-		} else {
-			atomic_andnot(BIT(job->slot), &ctx->engine->slots_in_use);
-		}
-		spin_unlock_irqrestore(&ctx->engine->lock, flags);
+	spin_lock_irqsave(&ctx->engine->lock, flags);
+	if (!list_empty(&ctx->engine->pending)) {
+		next = list_first_entry(&ctx->engine->pending,
+					struct airoha_crypto_work, pending);
+		list_del_init(&next->pending);
+		ctx->engine->pending_count--;
+		next->slot = job->slot;
+		WARN_ON_ONCE(!queue_work(ctx->engine->workqueue, &next->work));
+	} else {
+		atomic_andnot(BIT(job->slot), &ctx->engine->slots_in_use);
 	}
+	spin_unlock_irqrestore(&ctx->engine->lock, flags);
+}
 	aead_request_complete(req, err);
 	kfree_rcu(job, rcu);
 }

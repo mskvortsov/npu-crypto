@@ -1,0 +1,15 @@
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  -clang-analyzer-core.FixedAddressDereference,
+  -performance-no-int-to-ptr,
+  -bugprone-easily-swappable-parameters
+# Fixed-address dereferences and integer-to-pointer casts are required for
+# memory-mapped registers and DMA windows on this bare-metal RV32 target.
+# Crypto APIs use adjacent byte/limb arrays; their types alone do not indicate
+# a swapped argument (and field multiplication's inputs are commutative).
+HeaderFilterRegex: '.*npu/.*'
+WarningsAsErrors: '*'
